@@ -1,0 +1,23 @@
+{
+  "host": "127.0.0.1",
+  "port": 2455,
+  "request_timeout_seconds": 120,
+  "max_attempts": 3,
+  "accounts": [
+    {
+      "name": "cloudflare-1",
+      "account_id": "ACCOUNT_ID_1",
+      "api_token": "API_TOKEN_1"
+    },
+    {
+      "name": "cloudflare-2",
+      "account_id": "ACCOUNT_ID_2",
+      "api_token": "API_TOKEN_2"
+    },
+    {
+      "name": "cloudflare-3",
+      "account_id": "ACCOUNT_ID_3",
+      "api_token": "API_TOKEN_3"
+    }
+  ]
+}

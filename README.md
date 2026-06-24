@@ -46,6 +46,14 @@ Health check:
 curl http://localhost:2455/health
 ```
 
+Web dashboard:
+
+```text
+http://localhost:2455/
+```
+
+The dashboard shows configured accounts, the local OpenCode base URL, retry settings, and a link to the health endpoint.
+
 ## Environment-only config
 
 Instead of `config.json`, you can configure accounts with:
