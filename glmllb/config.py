@@ -24,6 +24,7 @@ class CloudflareAccount:
 
 @dataclass(frozen=True)
 class Settings:
+    config_path: Path
     host: str
     port: int
     request_timeout_seconds: float
@@ -49,13 +50,8 @@ def load_settings(config_path: str | None = None) -> Settings:
         for item in accounts_raw
     ]
 
-    if not accounts:
-        raise RuntimeError(
-            "No Cloudflare accounts configured. Create config.json or set "
-            "CLOUDFLARE_ACCOUNTS='account_id:api_token,account_id:api_token'."
-        )
-
     return Settings(
+        config_path=path,
         host=str(raw.get("host") or os.getenv("GLMLLB_HOST", "127.0.0.1")),
         port=int(raw.get("port") or os.getenv("GLMLLB_PORT", "2455")),
         request_timeout_seconds=float(raw.get("request_timeout_seconds") or os.getenv("GLMLLB_TIMEOUT", "120")),

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import itertools
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from html import escape
+from urllib.parse import parse_qs
 
 import httpx
 import uvicorn
@@ -59,6 +61,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def dashboard() -> str:
         return _dashboard_html(settings)
 
+    @app.get("/setup", response_class=HTMLResponse)
+    async def setup_form() -> str:
+        return _setup_html(settings)
+
+    @app.post("/setup", response_class=HTMLResponse)
+    async def save_setup(request: Request) -> str:
+        body = (await request.body()).decode()
+        form = parse_qs(body, keep_blank_values=True)
+        accounts = []
+
+        for index in range(1, 6):
+            account_id = _form_value(form, f"account_id_{index}")
+            api_token = _form_value(form, f"api_token_{index}")
+            name = _form_value(form, f"name_{index}") or f"cloudflare-{index}"
+            if account_id or api_token:
+                if not account_id or not api_token:
+                    return _setup_html(settings, error=f"Account #{index} needs both account ID and API token.")
+                accounts.append({"name": name, "account_id": account_id, "api_token": api_token})
+
+        if not accounts:
+            return _setup_html(settings, error="Add at least one Cloudflare account.")
+
+        config = {
+            "host": settings.host,
+            "port": settings.port,
+            "request_timeout_seconds": settings.request_timeout_seconds,
+            "max_attempts": min(settings.max_attempts, len(accounts)) or 1,
+            "accounts": accounts,
+        }
+        settings.config_path.write_text(json.dumps(config, indent=2) + "\n")
+        return _setup_html(settings, saved=True)
+
     @app.get("/health")
     async def health() -> dict[str, object]:
         return {
@@ -71,6 +105,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def proxy(path: str, request: Request) -> Response:
         if client is None:
             return JSONResponse({"error": "Proxy client is not ready."}, status_code=503)
+        if not settings.accounts:
+            return JSONResponse(
+                {"error": "No Cloudflare accounts configured.", "setup_url": "/setup"},
+                status_code=428,
+            )
 
         body = await request.body()
         incoming_headers = _forward_headers(request)
@@ -161,8 +200,14 @@ def _dashboard_html(settings: Settings) -> str:
         </tr>
         """
         for account in settings.accounts
-    )
+    ) or """
+        <tr>
+          <td colspan="3">No accounts configured yet. Open <a href="/setup">setup</a> to add Cloudflare credentials locally.</td>
+        </tr>
+    """
     base_url = f"http://{settings.host}:{settings.port}/v1"
+    status_text = "Proxy online" if settings.accounts else "Setup required"
+    status_class = "status-pill" if settings.accounts else "status-pill warning"
 
     return f"""<!doctype html>
 <html lang="en">
@@ -181,6 +226,7 @@ def _dashboard_html(settings: Settings) -> str:
       --line: #2a2f3c;
       --accent: #f2c14e;
       --green: #4ade80;
+      --orange: #fb923c;
     }}
     * {{ box-sizing: border-box; }}
     body {{
@@ -211,7 +257,9 @@ def _dashboard_html(settings: Settings) -> str:
     .metric span {{ color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; }}
     .status {{ padding: 28px; display: flex; flex-direction: column; justify-content: space-between; }}
     .status-pill {{ display: inline-flex; align-items: center; gap: 10px; width: fit-content; padding: 10px 14px; border: 1px solid rgba(74, 222, 128, 0.34); border-radius: 999px; color: var(--green); background: rgba(74, 222, 128, 0.08); font-weight: 700; }}
+    .status-pill.warning {{ border-color: rgba(251, 146, 60, 0.38); color: var(--orange); background: rgba(251, 146, 60, 0.1); }}
     .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 18px var(--green); }}
+    .warning .dot {{ background: var(--orange); box-shadow: 0 0 18px var(--orange); }}
     code {{ color: #f8e9b0; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.92em; }}
     pre {{ overflow-x: auto; margin: 18px 0 0; padding: 18px; border-radius: 18px; background: #050609; border: 1px solid var(--line); color: #d7dde8; }}
     section {{ margin-top: 24px; padding: 28px; }}
@@ -248,7 +296,7 @@ def _dashboard_html(settings: Settings) -> str:
       </div>
       <div class="card status">
         <div>
-          <div class="status-pill"><span class="dot"></span>Proxy online</div>
+          <div class="{status_class}"><span class="dot"></span>{status_text}</div>
           <pre>baseURL: {escape(base_url)}
 health:  http://{escape(settings.host)}:{settings.port}/health</pre>
         </div>
@@ -268,6 +316,7 @@ health:  http://{escape(settings.host)}:{settings.port}/health</pre>
       <h2>Quick Actions</h2>
       <div class="actions">
         <div class="action"><b>OpenCode URL</b><code>{escape(base_url)}</code></div>
+        <div class="action"><b>Setup Accounts</b><a href="/setup">/setup</a></div>
         <div class="action"><b>Health JSON</b><a href="/health">/health</a></div>
         <div class="action"><b>Proxy Path</b><code>/v1/*</code></div>
       </div>
@@ -275,6 +324,74 @@ health:  http://{escape(settings.host)}:{settings.port}/health</pre>
   </main>
 </body>
 </html>"""
+
+
+def _setup_html(settings: Settings, saved: bool = False, error: str | None = None) -> str:
+    account_rows = "".join(
+        f"""
+        <fieldset>
+          <legend>Cloudflare Account #{index}</legend>
+          <label>Name <input name="name_{index}" value="cloudflare-{index}" autocomplete="off"></label>
+          <label>Account ID <input name="account_id_{index}" autocomplete="off" placeholder="Cloudflare account ID"></label>
+          <label>API Token <input name="api_token_{index}" type="password" autocomplete="off" placeholder="Cloudflare API token"></label>
+        </fieldset>
+        """
+        for index in range(1, 6)
+    )
+    notice = ""
+    if saved:
+        notice = "<div class=\"notice success\">Saved to local config.json. Restart glmllb, then open the dashboard.</div>"
+    elif error:
+        notice = f"<div class=\"notice error\">{escape(error)}</div>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>glmllb setup</title>
+  <style>
+    :root {{ color-scheme: dark; --bg: #08090d; --panel: #11131a; --line: #2a2f3c; --text: #f3f5f7; --muted: #9aa3b2; --accent: #f2c14e; --green: #4ade80; --red: #fb7185; }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; background: radial-gradient(circle at top left, rgba(242,193,78,.16), transparent 30rem), var(--bg); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ width: min(920px, calc(100% - 32px)); margin: 0 auto; padding: 48px 0; }}
+    .card {{ border: 1px solid var(--line); background: rgba(17,19,26,.9); border-radius: 24px; padding: 32px; box-shadow: 0 24px 80px rgba(0,0,0,.35); }}
+    a {{ color: var(--accent); text-decoration: none; }}
+    h1 {{ margin: 0 0 12px; font-size: clamp(40px, 8vw, 76px); line-height: .92; letter-spacing: -.07em; }}
+    p {{ margin: 0 0 24px; color: var(--muted); line-height: 1.7; }}
+    form {{ display: grid; gap: 16px; }}
+    fieldset {{ display: grid; gap: 12px; margin: 0; padding: 18px; border: 1px solid var(--line); border-radius: 18px; }}
+    legend {{ padding: 0 8px; color: var(--accent); font-weight: 800; }}
+    label {{ display: grid; gap: 7px; color: var(--muted); font-size: 13px; font-weight: 700; letter-spacing: .02em; }}
+    input {{ width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; background: #07080d; color: var(--text); font: inherit; }}
+    button {{ border: 0; border-radius: 14px; padding: 14px 18px; background: var(--accent); color: #171103; font-weight: 900; cursor: pointer; }}
+    code {{ color: #f8e9b0; }}
+    .notice {{ margin-bottom: 18px; padding: 14px 16px; border-radius: 14px; font-weight: 800; }}
+    .success {{ border: 1px solid rgba(74,222,128,.35); background: rgba(74,222,128,.1); color: var(--green); }}
+    .error {{ border: 1px solid rgba(251,113,133,.35); background: rgba(251,113,133,.1); color: var(--red); }}
+    .meta {{ margin-top: 18px; font-size: 14px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="card">
+      <h1>Setup glmllb</h1>
+      <p>Add Cloudflare account IDs and API tokens. They are written only to <code>{escape(str(settings.config_path))}</code> on this system. <code>config.json</code> is ignored by git.</p>
+      {notice}
+      <form method="post" action="/setup">
+        {account_rows}
+        <button type="submit">Save Local Configuration</button>
+      </form>
+      <p class="meta"><a href="/">Back to dashboard</a></p>
+    </div>
+  </main>
+</body>
+</html>"""
+
+
+def _form_value(form: dict[str, list[str]], key: str) -> str:
+    values = form.get(key) or [""]
+    return values[0].strip()
 
 
 def _mask_account_id(account_id: str) -> str:

@@ -23,10 +23,21 @@ https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/*
 python -m venv .venv
 . .venv/bin/activate
 pip install -e .
-cp config.example.json config.json
 ```
 
-Edit `config.json` with each Cloudflare account ID and API token.
+Start the app, then open the browser setup page:
+
+```bash
+glmllb
+```
+
+```text
+http://localhost:2455/setup
+```
+
+Enter your Cloudflare account IDs and API tokens in the setup page. They are saved only to local `config.json`, which is ignored by git.
+
+Restart `glmllb` after saving setup so the proxy reloads the new accounts.
 
 ## Run
 
