@@ -35,7 +35,9 @@ glmllb
 http://localhost:2455/setup
 ```
 
-Enter your Cloudflare account IDs and API tokens in the setup page. They are saved only to local `config.json`, which is ignored by git.
+Enter as many Cloudflare account IDs and API tokens as you want in the setup page. Optional token limits and reset windows are saved with each account so the local dashboard can estimate remaining quota and reset timing.
+
+Credentials are saved only to local `config.json`, which is ignored by git.
 
 Restart `glmllb` after saving setup so the proxy reloads the new accounts.
 
@@ -63,7 +65,15 @@ Web dashboard:
 http://localhost:2455/
 ```
 
-The dashboard shows configured accounts, the local OpenCode base URL, retry settings, and a link to the health endpoint.
+The dashboard shows configured accounts, the local OpenCode base URL, observed token usage, per-account token usage, estimated remaining quota, reset timing, and links to setup/usage endpoints.
+
+Usage JSON:
+
+```bash
+curl http://localhost:2455/usage
+```
+
+Token counts are local observations from provider `usage` fields. Streaming responses or providers that omit usage are counted as unknown-token responses because the proxy cannot infer exact tokens without provider usage data.
 
 ## Environment-only config
 
@@ -96,4 +106,3 @@ Use the Cloudflare model names you normally send to Workers AI, for example:
 ```text
 @cf/meta/llama-3.1-8b-instruct
 ```
-# glmllb

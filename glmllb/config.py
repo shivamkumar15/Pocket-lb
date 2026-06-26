@@ -15,6 +15,8 @@ class CloudflareAccount:
     name: str
     account_id: str
     api_token: str
+    token_limit: int | None = None
+    reset_period_hours: int | None = None
     upstream_base: str = DEFAULT_UPSTREAM_BASE
 
     def endpoint(self, path: str) -> str:
@@ -45,6 +47,8 @@ def load_settings(config_path: str | None = None) -> Settings:
             name=str(item.get("name") or item["account_id"]),
             account_id=str(item["account_id"]),
             api_token=str(item["api_token"]),
+            token_limit=_optional_int(item.get("token_limit")),
+            reset_period_hours=_optional_int(item.get("reset_period_hours")),
             upstream_base=str(item.get("upstream_base") or DEFAULT_UPSTREAM_BASE),
         )
         for item in accounts_raw
@@ -52,10 +56,10 @@ def load_settings(config_path: str | None = None) -> Settings:
 
     return Settings(
         config_path=path,
-        host=str(raw.get("host") or os.getenv("GLMLLB_HOST", "127.0.0.1")),
-        port=int(raw.get("port") or os.getenv("GLMLLB_PORT", "2455")),
-        request_timeout_seconds=float(raw.get("request_timeout_seconds") or os.getenv("GLMLLB_TIMEOUT", "120")),
-        max_attempts=max(1, int(raw.get("max_attempts") or os.getenv("GLMLLB_MAX_ATTEMPTS", str(len(accounts))))),
+        host=str(os.getenv("GLMLLB_HOST") or raw.get("host") or "127.0.0.1"),
+        port=int(os.getenv("GLMLLB_PORT") or raw.get("port") or "2455"),
+        request_timeout_seconds=float(os.getenv("GLMLLB_TIMEOUT") or raw.get("request_timeout_seconds") or "120"),
+        max_attempts=max(1, int(os.getenv("GLMLLB_MAX_ATTEMPTS") or raw.get("max_attempts") or str(len(accounts)))),
         accounts=accounts,
     )
 
@@ -78,3 +82,9 @@ def _accounts_from_env() -> list[dict[str, str]]:
             }
         )
     return accounts
+
+
+def _optional_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    return int(value)
