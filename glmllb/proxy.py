@@ -321,8 +321,7 @@ def _response_headers(response: httpx.Response, account_name: str) -> dict[str, 
 async def _tracked_response(response: httpx.Response, account: CloudflareAccount, usage_tracker: UsageTracker) -> Response:
     content_type = response.headers.get("content-type", "")
     if "text/event-stream" in content_type:
-        usage_tracker.record(account, None)
-        return _stream_response(response, account.name)
+        return _stream_response(response, account, usage_tracker)
 
     body = await response.aread()
     payload = None
@@ -341,10 +340,23 @@ async def _tracked_response(response: httpx.Response, account: CloudflareAccount
     )
 
 
-def _stream_response(response: httpx.Response, account_name: str) -> StreamingResponse:
+def _stream_response(response: httpx.Response, account: CloudflareAccount, usage_tracker: UsageTracker) -> StreamingResponse:
     async def body() -> AsyncIterator[bytes]:
+        buffer = b""
         try:
             async for chunk in response.aiter_bytes():
+                buffer += chunk
+                while b"\n" in buffer:
+                    line, buffer = buffer.split(b"\n", 1)
+                    if line.startswith(b"data: "):
+                        data_str = line[6:].strip()
+                        if data_str and data_str != b"[DONE]":
+                            try:
+                                payload = json.loads(data_str.decode("utf-8"))
+                                if payload.get("usage"):
+                                    usage_tracker.record(account, payload)
+                            except Exception:
+                                pass
                 yield chunk
         finally:
             await response.aclose()
@@ -352,7 +364,7 @@ def _stream_response(response: httpx.Response, account_name: str) -> StreamingRe
     return StreamingResponse(
         body(),
         status_code=response.status_code,
-        headers=_response_headers(response, account_name),
+        headers=_response_headers(response, account.name),
         media_type=response.headers.get("content-type"),
     )
 
@@ -929,12 +941,12 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --bg: oklch(0.145 0.012 255);
-      --bg-rail: oklch(0.18 0.015 255);
-      --panel: oklch(0.205 0.014 255);
-      --panel-raised: oklch(0.24 0.016 255);
-      --line: oklch(0.34 0.018 255);
-      --line-strong: oklch(0.43 0.022 255);
+      --bg: oklch(0.08 0.008 255);
+      --bg-rail: oklch(0.105 0.01 255);
+      --panel: oklch(0.13 0.012 255);
+      --panel-raised: oklch(0.165 0.014 255);
+      --line: oklch(0.22 0.015 255);
+      --line-strong: oklch(0.3 0.018 255);
       --text: oklch(0.955 0.006 255);
       --muted: oklch(0.72 0.018 255);
       --quiet: oklch(0.58 0.02 255);

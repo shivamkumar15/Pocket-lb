@@ -1,14 +1,15 @@
 # glmllb
 
-Local Cloudflare Workers AI account load balancer for OpenAI-compatible AI tools.
+A local load-balancing proxy for [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/) that exposes an OpenAI-compatible API. Round-robin across multiple Cloudflare accounts, auto-retry on rate limits, track token usage, and manage everything from a built-in web dashboard.
 
 ```text
-OpenCode / OpenAI-compatible client
+OpenCode / Cline / Aider / any OpenAI-compatible client
   -> http://localhost:2456/v1
-  -> glmllb Cloudflare proxy
+  -> glmllb proxy (round-robin + retry + usage tracking)
   -> Cloudflare Account #1
   -> Cloudflare Account #2
   -> Cloudflare Account #3
+  -> ...
 ```
 
 The proxy forwards local `/v1/*` requests to Cloudflare Workers AI's OpenAI-compatible path:
@@ -17,7 +18,25 @@ The proxy forwards local `/v1/*` requests to Cloudflare Workers AI's OpenAI-comp
 https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/*
 ```
 
-## Setup
+## Features
+
+- **Multi-account load balancing** — round-robin requests across unlimited Cloudflare accounts.
+- **Automatic failover** — retries the next account on `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`.
+- **Model mappings** — map standard model names (e.g. `gpt-4o`, `claude-3-5-sonnet`) to any Cloudflare Workers AI model. Configure in the Settings tab.
+- **Streaming support** — preserves Server-Sent Events (SSE) streaming and parses token usage from stream chunks.
+- **Token usage tracking** — records prompt, completion, and total tokens per account from both regular and streaming responses.
+- **Web dashboard** — live view of accounts, quota usage, per-account token distribution, model mappings, and endpoint info.
+- **Dark/light theme** — toggle in the dashboard; dark mode uses near-black surfaces.
+- **Local-first security** — credentials are stored only in local `config.json` (git-ignored).
+- **Docker support** — ships with a `Dockerfile` and `docker-compose.yml`.
+
+## Quick Start
+
+### Prerequisites
+
+- Python 3.11+
+
+### Install
 
 ```bash
 python -m venv .venv
@@ -25,33 +44,39 @@ python -m venv .venv
 pip install -e .
 ```
 
-Start the app, then open the browser setup page:
+### Run
 
 ```bash
 glmllb
 ```
+
+Then open the setup page in your browser:
 
 ```text
 http://localhost:2456/setup
 ```
 
-Enter as many Cloudflare account IDs and API tokens as you want in the setup page. Optional token limits and reset windows are saved with each account so the local dashboard can estimate remaining quota and reset timing.
+Enter your Cloudflare account IDs and API tokens. You can add as many accounts as you want. Optional token limits and reset windows can be saved per account so the dashboard can estimate remaining quota and reset timing.
 
-Credentials are saved only to local `config.json`, which is ignored by git.
+Restart `glmllb` after saving to reload the new accounts.
 
-Restart `glmllb` after saving setup so the proxy reloads the new accounts.
-
-## Run
+### Docker
 
 ```bash
-glmllb
+docker-compose up -d
 ```
 
-The default base URL is:
+The container exposes port `2456` and mounts your local `config.json`.
 
-```text
-http://localhost:2456/v1
-```
+## Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/` | GET | Web dashboard (accounts, usage, quota, model mappings) |
+| `/setup` | GET/POST | Browser-based account configuration |
+| `/health` | GET | Health check JSON |
+| `/usage` | GET | Token usage JSON (per-account stats) |
+| `/v1/*` | POST | OpenAI-compatible proxy (chat completions, embeddings, etc.) |
 
 Health check:
 
@@ -59,25 +84,84 @@ Health check:
 curl http://localhost:2456/health
 ```
 
-Web dashboard:
-
-```text
-http://localhost:2456/
-```
-
-The dashboard shows configured accounts, the local OpenAI-compatible base URL, observed token usage, per-account token usage, estimated remaining quota, reset timing, and links to setup/usage endpoints.
-
 Usage JSON:
 
 ```bash
 curl http://localhost:2456/usage
 ```
 
-Token counts are local observations from provider `usage` fields. Streaming responses or providers that omit usage are counted as unknown-token responses because the proxy cannot infer exact tokens without provider usage data.
+## Using With AI Tools
 
-## Environment-only config
+Point any OpenAI-compatible tool at:
 
-Instead of `config.json`, you can configure accounts with:
+```text
+Base URL: http://localhost:2456/v1
+API key: any non-empty value (e.g. glmllb-local)
+```
+
+The local API key is not used for Cloudflare authentication. Cloudflare credentials come from `config.json` or the `CLOUDFLARE_ACCOUNTS` environment variable.
+
+### Model Mappings
+
+Set up model mappings in the **Settings** tab of the dashboard to translate standard model names to Cloudflare Workers AI models:
+
+```text
+gpt-4o          -> @cf/meta/llama-3.1-8b-instruct
+gpt-4o-mini     -> @cf/meta/llama-3.1-8b-instruct
+claude-3-5-sonnet -> @cf/meta/llama-3.1-8b-instruct
+glm-5.2         -> @cf/zai-org/glm-5.2
+```
+
+You can also use Cloudflare model names directly (e.g. `@cf/zai-org/glm-5.2`).
+
+### OpenCode
+
+```bash
+opencode --api-base http://localhost:2456/v1 --api-key dummy --model gpt-4o
+```
+
+### Cline / Continue / Aider / Roo Code
+
+Choose the OpenAI-compatible/custom provider and set:
+
+```text
+Base URL: http://localhost:2456/v1
+API key: glmllb-local
+Model: gpt-4o (or any mapped model name)
+```
+
+### Claude Code
+
+Claude Code uses the Anthropic Messages API (`/v1/messages`), which is not OpenAI-compatible. This proxy forwards `/v1/*` directly to Cloudflare Workers AI's OpenAI-compatible endpoint, so Claude Code is not supported without an Anthropic-to-OpenAI translation layer.
+
+## Configuration
+
+### config.json
+
+Created by the setup page. Git-ignored so secrets stay local.
+
+```json
+{
+  "host": "127.0.0.1",
+  "port": 2456,
+  "request_timeout_seconds": 120.0,
+  "max_attempts": 3,
+  "model_mapping": {
+    "gpt-4o": "@cf/meta/llama-3.1-8b-instruct"
+  },
+  "accounts": [
+    {
+      "name": "account-1",
+      "account_id": "your-account-id",
+      "api_token": "your-api-token"
+    }
+  ]
+}
+```
+
+### Environment Variables
+
+Instead of `config.json`, you can configure accounts via environment:
 
 ```bash
 export CLOUDFLARE_ACCOUNTS='account_id_1:token_1,account_id_2:token_2,account_id_3:token_3'
@@ -89,52 +173,41 @@ glmllb
 
 - Round-robins requests across configured accounts.
 - Retries another account on `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`.
-- Preserves streaming responses.
-- Adds `x-glmllb-account` to responses so you can see which account handled a request.
-- Keeps `config.json` ignored so secrets are not committed by accident.
+- Preserves streaming responses (SSE) and extracts token usage from stream chunks.
+- Adds `x-glmllb-account` header to responses so you can see which account handled a request.
+- Token counts are local observations from provider `usage` fields. Non-streaming responses and streaming responses with usage data are tracked; providers that omit usage are counted as unknown-token responses.
+- Keeps `config.json` git-ignored so secrets are never committed.
 
-## Using With AI Tools
+## Dashboard
 
-Use glmllb with tools that can talk to an OpenAI-compatible API and let you set a custom base URL.
+The web dashboard at `http://localhost:2456/` provides:
 
-```text
-Base URL: http://localhost:2456/v1
-API key: any non-empty value if the client requires one
-Model: You can now use standard names like `gpt-4o` or `claude-3-5-sonnet-20241022` if you set up Model Mappings in the Settings tab, or you can use Cloudflare model names directly.
-```
+- **Quota overview** — aggregate usage across all accounts with a progress meter and donut chart.
+- **Account distribution** — per-account token usage breakdown.
+- **Per-account cards** — individual account health, usage, and quota meters.
+- **Model mappings** — view configured model name translations.
+- **Endpoint info** — base URL, health, and usage JSON links.
+- **Dark/light theme toggle** — dark mode uses deep near-black surfaces.
 
-The local API key is not used for Cloudflare authentication. Cloudflare credentials come from `config.json` or `CLOUDFLARE_ACCOUNTS`.
+The dashboard auto-refreshes usage data from the backend.
 
-### OpenCode
-
-Point OpenCode at:
-
-```text
-baseURL: http://localhost:2456/v1
-```
-
-Because you can now set up **Model Mappings** in the Settings tab, you can use standard model names in OpenCode:
-
-```bash
-opencode --api-base http://localhost:2456/v1 --api-key dummy --model gpt-4o
-```
-
-(The proxy will automatically translate `gpt-4o` to your chosen Cloudflare model, like `@cf/meta/llama-3.1-8b-instruct`).
-
-### Other OpenAI-Compatible Tools
-
-For tools such as Aider, Continue, Cline, Roo Code, or editors with a generic OpenAI-compatible provider, choose the OpenAI-compatible/custom provider and set the base URL to:
+## Project Structure
 
 ```text
-http://localhost:2456/v1
+glmllb/
+├── glmllb/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── config.py        # Settings dataclass, config loading
+│   └── proxy.py         # FastAPI app, proxy logic, dashboard HTML
+├── hud-dashboard/        # Standalone HUD-style React dashboard (optional)
+├── config.example.json
+├── docker-compose.yml
+├── Dockerfile
+├── pyproject.toml
+└── README.md
 ```
 
-If the tool requires an API key, use a placeholder value such as `glmllb-local`.
+## License
 
-### Claude Code
-
-Claude Code does not use the OpenAI-compatible chat completions API by default. It normally sends Anthropic Messages API requests to `/v1/messages`.
-
-This proxy currently forwards `/v1/*` directly to Cloudflare Workers AI's OpenAI-compatible endpoint, so Claude Code cannot be pointed at `http://localhost:2456` unless an Anthropic-to-OpenAI translation layer is added first.
-
-For Claude Code support, glmllb would need an Anthropic-compatible adapter that accepts Claude Code's `/v1/messages` requests, converts them to OpenAI-compatible chat completions for Cloudflare Workers AI, then converts the response back to Anthropic's response shape.
+See repository for license details.
