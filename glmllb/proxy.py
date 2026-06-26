@@ -187,6 +187,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "port": settings.port,
             "request_timeout_seconds": settings.request_timeout_seconds,
             "max_attempts": min(settings.max_attempts, len(accounts)) or 1,
+            "model_mapping": settings.model_mapping,
             "accounts": accounts,
         }
         settings.config_path.write_text(json.dumps(config, indent=2) + "\n")

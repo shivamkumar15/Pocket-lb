@@ -24,7 +24,7 @@ class CloudflareAccount:
         return f"{base}/{path.lstrip('/')}"
 
 
-@dataclass(frozen=True)
+@dataclass
 class Settings:
     config_path: Path
     host: str
