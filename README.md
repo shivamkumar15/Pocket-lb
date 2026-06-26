@@ -100,7 +100,7 @@ Use glmllb with tools that can talk to an OpenAI-compatible API and let you set 
 ```text
 Base URL: http://localhost:2456/v1
 API key: any non-empty value if the client requires one
-Model: @cf/meta/llama-3.1-8b-instruct, or another Workers AI model name
+Model: You can now use standard names like `gpt-4o` or `claude-3-5-sonnet-20241022` if you set up Model Mappings in the Settings tab, or you can use Cloudflare model names directly.
 ```
 
 The local API key is not used for Cloudflare authentication. Cloudflare credentials come from `config.json` or `CLOUDFLARE_ACCOUNTS`.
@@ -113,11 +113,13 @@ Point OpenCode at:
 baseURL: http://localhost:2456/v1
 ```
 
-Use the Cloudflare model names you normally send to Workers AI, for example:
+Because you can now set up **Model Mappings** in the Settings tab, you can use standard model names in OpenCode:
 
-```text
-@cf/meta/llama-3.1-8b-instruct
+```bash
+opencode --api-base http://localhost:2456/v1 --api-key dummy --model gpt-4o
 ```
+
+(The proxy will automatically translate `gpt-4o` to your chosen Cloudflare model, like `@cf/meta/llama-3.1-8b-instruct`).
 
 ### Other OpenAI-Compatible Tools
 

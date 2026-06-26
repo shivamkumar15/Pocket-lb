@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  glmllb:
+    build: .
+    container_name: glmllb
+    restart: unless-stopped
+    ports:
+      - "2456:2456"
+    volumes:
+      - ./config.json:/app/config.json
