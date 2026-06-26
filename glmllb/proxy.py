@@ -11,7 +11,7 @@ from urllib.parse import parse_qs
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
 from glmllb.config import CloudflareAccount, Settings, load_settings
 
@@ -146,15 +146,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(title="glmllb", version="0.1.0", lifespan=lifespan)
 
     @app.get("/", response_class=HTMLResponse)
-    async def dashboard() -> str:
-        return _dashboard_html(settings, usage_tracker)
+    async def dashboard(saved: bool = False, error: str | None = None) -> str:
+        return _dashboard_html(settings, usage_tracker, saved=saved, error=error)
 
-    @app.get("/setup", response_class=HTMLResponse)
-    async def setup_form() -> str:
-        return _setup_html(settings)
+    @app.get("/setup")
+    async def setup_form() -> RedirectResponse:
+        return RedirectResponse(url="/?tab=settings")
 
-    @app.post("/setup", response_class=HTMLResponse)
-    async def save_setup(request: Request) -> str:
+    @app.post("/setup")
+    async def save_setup(request: Request) -> RedirectResponse:
         body = (await request.body()).decode()
         form = parse_qs(body, keep_blank_values=True)
         accounts = []
@@ -163,12 +163,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         for index in range(1, account_count + 1):
             account_id = _form_value(form, f"account_id_{index}")
             api_token = _form_value(form, f"api_token_{index}")
-            name = _form_value(form, f"name_{index}") or f"cloudflare-{index}"
+            name = _form_value(form, f"name_{index}") or f"user-{index}@example.com"
             token_limit = _form_value(form, f"token_limit_{index}")
             reset_period_hours = _form_value(form, f"reset_period_hours_{index}")
             if account_id or api_token:
                 if not account_id or not api_token:
-                    return _setup_html(settings, error=f"Account #{index} needs both account ID and API token.")
+                    from urllib.parse import quote
+                    err_msg = quote(f"Account #{index} needs both account ID and API token.")
+                    return RedirectResponse(url=f"/?error={err_msg}", status_code=303)
                 account = {"name": name, "account_id": account_id, "api_token": api_token}
                 if token_limit:
                     account["token_limit"] = int(token_limit)
@@ -177,7 +179,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 accounts.append(account)
 
         if not accounts:
-            return _setup_html(settings, error="Add at least one Cloudflare account.")
+            from urllib.parse import quote
+            return RedirectResponse(url=f"/?error={quote('Add at least one Cloudflare account.')}", status_code=303)
 
         config = {
             "host": settings.host,
@@ -187,7 +190,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "accounts": accounts,
         }
         settings.config_path.write_text(json.dumps(config, indent=2) + "\n")
-        return _setup_html(settings, saved=True)
+        
+        settings.accounts = [
+            CloudflareAccount(
+                name=acc["name"],
+                account_id=acc["account_id"],
+                api_token=acc["api_token"],
+                token_limit=acc.get("token_limit"),
+                reset_period_hours=acc.get("reset_period_hours"),
+            )
+            for acc in accounts
+        ]
+        settings.max_attempts = config["max_attempts"]
+        pool._accounts = settings.accounts
+        
+        return RedirectResponse(url="/?saved=1", status_code=303)
 
     @app.get("/health")
     async def health() -> dict[str, object]:
@@ -224,7 +241,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         body = await request.body()
-        incoming_headers = _forward_headers(request)
+        if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
+            try:
+                payload = json.loads(body)
+                if "model" in payload and payload["model"] in settings.model_mapping:
+                    payload["model"] = settings.model_mapping[payload["model"]]
+                    body = json.dumps(payload).encode("utf-8")
+                    # Update content-length if it exists
+                    if "content-length" in request.headers:
+                        incoming_headers = dict(_forward_headers(request))
+                        incoming_headers["content-length"] = str(len(body))
+                        _request_headers_cache = incoming_headers
+            except Exception:
+                pass
+                
+        incoming_headers = locals().get("_request_headers_cache", _forward_headers(request))
         last_response: httpx.Response | None = None
         last_error: Exception | None = None
 
@@ -325,20 +356,39 @@ def _stream_response(response: httpx.Response, account_name: str) -> StreamingRe
     )
 
 
-def _dashboard_html(settings: Settings, usage_tracker: UsageTracker) -> str:
+def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool = False, error: str | None = None) -> str:
     base_url = f"http://{settings.host}:{settings.port}/v1"
     status_label = "Online" if settings.accounts else "Setup required"
     status_class = "status-ok" if settings.accounts else "status-warn"
     snapshots = [(account, usage_tracker.snapshot(account)) for account in settings.accounts]
+    
+    existing = settings.accounts or [CloudflareAccount(name="", account_id="", api_token="")]
+    account_rows = "".join(_account_setup_block(index, account) for index, account in enumerate(existing, start=1))
+    notice = ""
+    if saved:
+        notice = "<div class=\"notice success\">Saved successfully. Your endpoint is now using the new accounts.</div>"
+    elif error:
+        notice = f"<div class=\"notice error\">{escape(error)}</div>"
     total_observed = sum(int(item["total_tokens"]) for _, item in snapshots)
     total_limit = sum(account.token_limit or 0 for account, _ in snapshots)
     total_remaining = None if total_limit == 0 else max(0, total_limit - total_observed)
+    total_requests = sum(int(item["requests"]) for _, item in snapshots)
+    total_unknown = sum(int(item["unknown_token_responses"]) for _, item in snapshots)
+    configured_quota_count = sum(1 for account, _ in snapshots if account.token_limit)
+    total_usage_percent = 0 if total_limit == 0 else min(100, int((total_observed / total_limit) * 100))
     rows = "".join(
         f"""
         <div class="account-card">
           <div class="account-top">
-            <div><b>{escape(account.name)}</b><code>{escape(_mask_account_id(account.account_id))}</code></div>
-            <span>{_format_int(int(item['total_tokens']))} tokens</span>
+            <div>
+              <b>{escape(account.name)}</b>
+              <code>{escape(_mask_account_id(account.account_id))}</code>
+            </div>
+            <span class="account-status">Active</span>
+          </div>
+          <div class="account-total">
+            <strong>{_format_int(int(item['total_tokens']))}</strong>
+            <span>observed tokens</span>
           </div>
           <div class="meter"><i style="width: {_usage_percent(account, item)}%"></i></div>
           <div class="quota-grid">
@@ -349,190 +399,804 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker) -> str:
             <span>Requests <b>{_format_int(int(item['requests']))}</b></span>
             <span>Reset <b>{_format_reset(item['reset_at'])}</b></span>
           </div>
-          <p class="hint">Unknown-token responses: {_format_int(int(item['unknown_token_responses']))}</p>
+          <div class="account-foot">
+            <span>Unknown-token responses: <b>{_format_int(int(item['unknown_token_responses']))}</b></span>
+            <span>Last used: <b>{_format_time_ago(item['last_used_at'])}</b></span>
+          </div>
         </div>
         """
         for account, item in snapshots
-    ) or "<p class=\"muted\">No Cloudflare accounts configured yet.</p>"
+    ) or """
+        <div class="empty-state">
+          <b>No accounts configured</b>
+          <p>Add Cloudflare account IDs and API tokens locally. The proxy will stay locked until setup is complete.</p>
+          <a class="button" href="/setup">Open Setup</a>
+        </div>
+    """
 
     return _codex_shell(
         title="GLM LLB",
         subtitle="API Load Balancer",
+        shell_class="dashboard-shell",
         body=f"""
-        <div class="panel-head">
+        <header class="dashboard-hero">
           <div>
             <h2>Dashboard</h2>
-            <p class="muted">Local Cloudflare-compatible endpoint for OpenCode.</p>
+            <p class="muted">Overview, account health, and recent request logs.</p>
           </div>
-          <span class="status {status_class}">{status_label}</span>
+          <div class="hero-actions">
+            <span class="status {status_class}">{status_label}</span>
+          </div>
+        </header>
+
+        <div id="tab-dashboard" class="tab-panel" style="display: block;">
+          <section class="stats">
+            <div><b id="stat-accounts">{len(settings.accounts)}</b><span>Accounts</span></div>
+            <div><b id="stat-requests">{_format_int(total_requests)}</b><span>Requests proxied</span></div>
+            <div><b id="stat-tokens">{_format_int(total_observed)}</b><span>Total tokens</span></div>
+            <div><b id="stat-remaining">{_format_optional_int(total_remaining)}</b><span>Estimated remaining</span></div>
+          </section>
+
+          <section class="dashboard-section quota-panel">
+              <div class="section-title">
+                <h3>Total quota</h3>
+                <span id="quota-configured">{configured_quota_count}/{len(settings.accounts)} configured</span>
+              </div>
+              <div class="quota-total">
+                <strong id="quota-observed">{_format_int(total_observed)}</strong>
+                <span>observed tokens</span>
+              </div>
+              <div class="meter large"><i id="quota-meter" style="width: {total_usage_percent}%"></i></div>
+              <div class="endpoint-meta">
+                <span>Remaining <b id="quota-remaining">{_format_optional_int(total_remaining)}</b></span>
+                <span>Unknown <b id="quota-unknown">{_format_int(total_unknown)}</b></span>
+              </div>
+          </section>
+
+          <section class="chart-grid">
+            <div class="chart-panel quota-chart-panel">
+              <div class="section-title">
+                <h3>Quota shape</h3>
+                <span>Observed vs remaining</span>
+              </div>
+              <div class="donut-wrap">
+                <svg class="donut" viewBox="0 0 120 120" role="img" aria-label="Quota usage chart">
+                  <circle class="donut-track" cx="60" cy="60" r="44"></circle>
+                  <circle class="donut-value" id="quota-donut" cx="60" cy="60" r="44" style="stroke-dasharray: {total_usage_percent} 100"></circle>
+                </svg>
+                <div class="donut-center">
+                  <b id="quota-percent">{total_usage_percent}%</b>
+                  <span>used</span>
+                </div>
+              </div>
+              <div class="chart-legend">
+                <span><i class="legend-used"></i>Observed</span>
+                <span><i class="legend-left"></i>Remaining / unset</span>
+              </div>
+            </div>
+
+            <div class="chart-panel">
+              <div class="section-title">
+                <h3>Account distribution</h3>
+                <span>Token split</span>
+              </div>
+              <div class="bar-chart" id="account-bars">{_account_bars(snapshots)}</div>
+            </div>
+          </section>
+
+          <section class="mini-chart-grid">
+            <div class="mini-chart-panel">
+              <div class="section-title">
+                <h3>Request mix</h3>
+                <span>Known vs unknown</span>
+              </div>
+              <div class="spark-bars" id="request-mix-bars">{_request_mix_bars(total_requests, total_unknown)}</div>
+            </div>
+            <div class="mini-chart-panel">
+              <div class="section-title">
+                <h3>Token composition</h3>
+                <span>Prompt / completion</span>
+              </div>
+              <div class="composition-chart" id="composition-chart">{_composition_chart(snapshots)}</div>
+            </div>
+            <div class="mini-chart-panel">
+              <div class="section-title">
+                <h3>Quota radar</h3>
+                <span>Per account usage</span>
+              </div>
+              <div class="radar-rings" id="quota-rings">{_quota_rings(snapshots)}</div>
+            </div>
+          </section>
         </div>
-        <div class="stack">
-          <label>OpenCode Base URL
-            <div class="copyline"><code>{escape(base_url)}</code></div>
-          </label>
-          <div class="stats">
-            <div><b>{len(settings.accounts)}</b><span>Accounts</span></div>
-            <div><b>{_format_int(total_observed)}</b><span>Observed tokens</span></div>
-            <div><b>{_format_optional_int(total_remaining)}</b><span>Remaining</span></div>
-          </div>
-          <p class="hint">Token counts are local observations from provider <code>usage</code> fields. Streaming responses or providers that omit usage are counted as unknown-token responses.</p>
-          <div class="accounts">{rows}</div>
-          <div class="actions">
-            <a class="button" href="/setup">Setup Accounts</a>
-            <a class="button secondary" href="/usage">Usage JSON</a>
-          </div>
+
+        <div id="tab-accounts" class="tab-panel" style="display: none;">
+          <section class="dashboard-section accounts-section">
+            <div class="section-title">
+              <h3>Accounts</h3>
+              <span>Round-robin failover pool</span>
+            </div>
+            <div class="accounts" id="accounts-list">{rows}</div>
+          </section>
         </div>
+
+        <div id="tab-settings" class="tab-panel" style="display: none;">
+          <section class="dashboard-section endpoint-panel endpoint-bottom">
+            <div class="section-title">
+              <h3>OpenAI-compatible endpoint</h3>
+              <span>/v1</span>
+            </div>
+            <label>Base URL
+              <div class="copyline"><code>{escape(base_url)}</code><button type="button" data-copy="{escape(base_url)}">Copy</button></div>
+            </label>
+            <div class="endpoint-meta">
+              <span>Host <b>{escape(settings.host)}</b></span>
+              <span>Port <b>{settings.port}</b></span>
+              <span>Retries <b>{settings.max_attempts}</b></span>
+              <span>Timeout <b>{settings.request_timeout_seconds:g}s</b></span>
+            </div>
+          </section>
+
+          <section class="dashboard-section model-mapping-panel">
+            <div class="section-title">
+              <h3>Model Mappings</h3>
+              <span>Configured client aliases</span>
+            </div>
+            <div style="font-size: 13px; line-height: 1.6; margin-bottom: 12px; color: var(--text-muted);">
+              When an AI client requests one of these models, the proxy rewrites it to the Cloudflare model shown. Edit <code>config.json</code> to modify these aliases.
+            </div>
+            <div style="display: grid; gap: 8px; font-family: var(--font-mono); font-size: 12px;">
+              {"".join(f'<div style="display: flex; gap: 12px; align-items: center; padding: 8px 12px; background: var(--bg-rail); border-radius: 6px;"><strong style="color: var(--text); min-width: 150px;">{escape(client_model)}</strong> <span style="color: var(--text-muted);">➔</span> <span>{escape(cf_model)}</span></div>' for client_model, cf_model in settings.model_mapping.items())}
+            </div>
+          </section>
+
+          <section class="dashboard-section">
+            <div class="section-title">
+              <h3>Setup Accounts</h3>
+              <span>Local config.json</span>
+            </div>
+            {notice}
+            <form method="post" action="/setup" class="stack" id="setup-form">
+              <input type="hidden" name="account_count" id="account-count" value="{len(existing)}">
+              <div id="account-setup-list">{account_rows}</div>
+              <div class="actions" style="margin-top: 10px;">
+                <button class="button secondary" type="button" id="add-account">Add Another Account</button>
+                <button class="button" type="submit">Save Configuration</button>
+              </div>
+            </form>
+          </section>
+
+          <section class="dashboard-section info-strip" style="flex-direction: row; flex-wrap: wrap;">
+            <p style="flex: 1; min-width: 300px;">Token counts are local observations from provider <code>usage</code> fields. Streaming responses or providers that omit usage are tracked as unknown-token responses. <span id="usage-sync">Waiting for backend sync...</span></p>
+            <div class="actions">
+              <a class="button secondary" href="/usage">Usage JSON</a>
+              <a class="button secondary" href="/health">Health JSON</a>
+            </div>
+          </section>
+        </div>
+
+        {_dashboard_script()}
         """,
     )
 
 
-def _setup_html(settings: Settings, saved: bool = False, error: str | None = None) -> str:
-    existing = settings.accounts or [CloudflareAccount(name="cloudflare-1", account_id="", api_token="")]
-    account_rows = "".join(_account_setup_block(index, account) for index, account in enumerate(existing, start=1))
-    notice = ""
-    if saved:
-        notice = "<div class=\"notice success\">Saved to local config.json. Restart glmllb, then open the dashboard.</div>"
-    elif error:
-        notice = f"<div class=\"notice error\">{escape(error)}</div>"
+def _dashboard_script() -> str:
+    return """<script>
+      const $ = (id) => document.getElementById(id);
+      const themeButton = $('theme-toggle');
+      const applyTheme = (theme) => {
+        document.documentElement.dataset.theme = theme;
+        localStorage.setItem('glmllb-theme', theme);
+        if (themeButton) {
+          themeButton.textContent = theme === 'dark' ? 'Light theme' : 'Dark theme';
+          themeButton.setAttribute('aria-label', `Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`);
+        }
+      };
+      applyTheme(localStorage.getItem('glmllb-theme') || 'light');
+      const formatInt = (value) => Number(value || 0).toLocaleString();
+      const formatOptionalInt = (value) => value === null || value === undefined ? 'Not set' : formatInt(value);
+      const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        "'": '&#39;',
+        '"': '&quot;',
+      }[char]));
+      const percent = (account) => {
+        if (!account.token_limit) return 0;
+        return Math.min(100, Math.floor((Number(account.total_tokens || 0) / account.token_limit) * 100));
+      };
+      const formatReset = (resetAt) => {
+        if (!resetAt) return 'Not set';
+        const seconds = Math.max(0, Math.floor(resetAt - (Date.now() / 1000)));
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        return hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+      };
+      const timeAgo = (timestamp) => {
+        if (!timestamp) return 'Never';
+        const seconds = Math.max(0, Math.floor((Date.now() / 1000) - timestamp));
+        if (seconds < 60) return 'Just now';
+        const minutes = Math.floor(seconds / 60);
+        if (minutes < 60) return `${minutes}m ago`;
+        const hours = Math.floor(minutes / 60);
+        if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
+        return `${Math.floor(hours / 24)}d ago`;
+      };
+      const accountCard = (account) => `
+        <div class="account-card">
+          <div class="account-top">
+            <div>
+              <b>${escapeHtml(account.name)}</b>
+              <code>${escapeHtml(account.account_id)}</code>
+            </div>
+            <span class="account-status">Active</span>
+          </div>
+          <div class="account-total">
+            <strong>${formatInt(account.total_tokens)}</strong>
+            <span>observed tokens</span>
+          </div>
+          <div class="meter"><i style="width: ${percent(account)}%"></i></div>
+          <div class="quota-grid">
+            <span>Prompt <b>${formatInt(account.prompt_tokens)}</b></span>
+            <span>Completion <b>${formatInt(account.completion_tokens)}</b></span>
+            <span>Limit <b>${formatOptionalInt(account.token_limit)}</b></span>
+            <span>Remaining <b>${formatOptionalInt(account.remaining_tokens)}</b></span>
+            <span>Requests <b>${formatInt(account.requests)}</b></span>
+            <span>Reset <b>${formatReset(account.reset_at)}</b></span>
+          </div>
+          <div class="account-foot">
+            <span>Unknown-token responses: <b>${formatInt(account.unknown_token_responses)}</b></span>
+            <span>Last used: <b>${timeAgo(account.last_used_at)}</b></span>
+          </div>
+        </div>`;
+      const renderUsage = ({ accounts = [] }) => {
+        const totalObserved = accounts.reduce((sum, account) => sum + Number(account.total_tokens || 0), 0);
+        const totalLimit = accounts.reduce((sum, account) => sum + Number(account.token_limit || 0), 0);
+        const totalRemaining = totalLimit ? Math.max(0, totalLimit - totalObserved) : null;
+        const totalRequests = accounts.reduce((sum, account) => sum + Number(account.requests || 0), 0);
+        const totalUnknown = accounts.reduce((sum, account) => sum + Number(account.unknown_token_responses || 0), 0);
+        const configuredQuota = accounts.filter((account) => account.token_limit).length;
 
-    return _codex_shell(
-        title="GLM LLB",
-        subtitle="API Load Balancer",
-        body=f"""
-        <h2>Setup</h2>
-        <p class="muted">Add as many Cloudflare accounts as you want. Optional token limits and reset windows power the local quota dashboard.</p>
-        {notice}
-        <form method="post" action="/setup" class="stack" id="setup-form">
-          <input type="hidden" name="account_count" id="account-count" value="{len(existing)}">
-          <div id="account-list">{account_rows}</div>
-          <button class="button secondary" type="button" id="add-account">Add Another Account</button>
-          <button class="button" type="submit">Save Configuration</button>
-        </form>
-        <p class="footnote"><a href="/">Back to dashboard</a></p>
-        <script>
-          const list = document.getElementById('account-list');
-          const count = document.getElementById('account-count');
-          document.getElementById('add-account').addEventListener('click', () => {{
-            const index = Number(count.value) + 1;
-            count.value = String(index);
-            list.insertAdjacentHTML('beforeend', `
-              <details open>
-                <summary>Cloudflare Account #${{index}}</summary>
-                <div class="field-grid">
-                  <label>Name <input name="name_${{index}}" value="cloudflare-${{index}}" autocomplete="off"></label>
-                  <label>Account ID <input name="account_id_${{index}}" autocomplete="off" placeholder="Cloudflare account ID"></label>
-                  <label>API Token <input name="api_token_${{index}}" type="password" autocomplete="off" placeholder="Cloudflare API token"></label>
-                  <label>Token Limit <input name="token_limit_${{index}}" inputmode="numeric" autocomplete="off" placeholder="Optional, e.g. 10000000"></label>
-                  <label>Reset Hours <input name="reset_period_hours_${{index}}" inputmode="numeric" autocomplete="off" placeholder="Optional, e.g. 24"></label>
-                </div>
-              </details>`);
-          }});
-        </script>
-        """,
+        $('quota-configured').textContent = `${configuredQuota}/${accounts.length} configured`;
+        $('quota-observed').textContent = formatInt(totalObserved);
+        const quotaPercent = totalLimit ? Math.min(100, Math.floor((totalObserved / totalLimit) * 100)) : 0;
+        $('quota-meter').style.width = `${quotaPercent}%`;
+        $('quota-donut').style.strokeDasharray = `${quotaPercent} 100`;
+        $('quota-percent').textContent = `${quotaPercent}%`;
+        $('quota-remaining').textContent = formatOptionalInt(totalRemaining);
+        $('quota-unknown').textContent = formatInt(totalUnknown);
+        $('stat-accounts').textContent = formatInt(accounts.length);
+        $('stat-requests').textContent = formatInt(totalRequests);
+        $('stat-tokens').textContent = formatInt(totalObserved);
+        $('stat-remaining').textContent = formatOptionalInt(totalRemaining);
+        $('account-bars').innerHTML = renderBars(accounts);
+        $('request-mix-bars').innerHTML = renderRequestMix(totalRequests, totalUnknown);
+        $('composition-chart').innerHTML = renderComposition(accounts);
+        $('quota-rings').innerHTML = renderQuotaRings(accounts);
+        $('accounts-list').innerHTML = accounts.length ? accounts.map(accountCard).join('') : `
+          <div class="empty-state">
+            <b>No accounts configured</b>
+            <p>Add Cloudflare account IDs and API tokens locally. The proxy will stay locked until setup is complete.</p>
+            <a class="button" href="/setup">Open Setup</a>
+          </div>`;
+        $('usage-sync').textContent = `Backend synced ${new Date().toLocaleTimeString()}.`;
+      };
+      const renderBars = (accounts) => {
+        if (!accounts.length) {
+          return '<div class="chart-empty">Add accounts to see token distribution.</div>';
+        }
+        const maxTokens = Math.max(...accounts.map((account) => Number(account.total_tokens || 0)), 1);
+        return accounts.map((account, index) => {
+          const total = Number(account.total_tokens || 0);
+          const width = Math.max(2, Math.round((total / maxTokens) * 100));
+          return `
+            <div class="bar-row">
+              <div class="bar-label">
+                <b>${escapeHtml(account.name)}</b>
+                <span>${formatInt(total)} tokens</span>
+              </div>
+              <div class="bar-track">
+                <i class="bar-fill fill-${index % 4}" style="width: ${width}%"></i>
+              </div>
+            </div>`;
+        }).join('');
+      };
+      const renderRequestMix = (totalRequests, totalUnknown) => {
+        const known = Math.max(0, totalRequests - totalUnknown);
+        const max = Math.max(known, totalUnknown, 1);
+        return [
+          ['Known', known, 'fill-0'],
+          ['Unknown', totalUnknown, 'fill-3'],
+        ].map(([label, value, fill]) => `
+          <div class="spark-row">
+            <span>${label}</span>
+            <i><b class="${fill}" style="height:${Math.max(8, Math.round((value / max) * 100))}%"></b></i>
+            <strong>${formatInt(value)}</strong>
+          </div>`).join('');
+      };
+      const renderComposition = (accounts) => {
+        const prompt = accounts.reduce((sum, account) => sum + Number(account.prompt_tokens || 0), 0);
+        const completion = accounts.reduce((sum, account) => sum + Number(account.completion_tokens || 0), 0);
+        const total = Math.max(prompt + completion, 1);
+        return `
+          <div class="composition-stack">
+            <i class="fill-1" style="width:${Math.max(2, Math.round((prompt / total) * 100))}%"></i>
+            <i class="fill-2" style="width:${Math.max(2, Math.round((completion / total) * 100))}%"></i>
+          </div>
+          <div class="composition-meta">
+            <span>Prompt <b>${formatInt(prompt)}</b></span>
+            <span>Completion <b>${formatInt(completion)}</b></span>
+          </div>`;
+      };
+      const renderQuotaRings = (accounts) => {
+        if (!accounts.length) return '<div class="chart-empty">No account quota data yet.</div>';
+        return accounts.slice(0, 6).map((account, index) => {
+          const used = percent(account);
+          return `
+            <div class="ring-chip">
+              <svg viewBox="0 0 42 42" aria-label="${escapeHtml(account.name)} quota">
+                <circle class="ring-track" cx="21" cy="21" r="15"></circle>
+                <circle class="ring-value fill-stroke-${index % 4}" cx="21" cy="21" r="15" style="stroke-dasharray:${used} 100"></circle>
+              </svg>
+              <span><b>${used}%</b>${escapeHtml(account.name)}</span>
+            </div>`;
+        }).join('');
+      };
+      const refreshUsage = async () => {
+        try {
+          const response = await fetch('/usage', { headers: { accept: 'application/json' } });
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          renderUsage(await response.json());
+        } catch (error) {
+          $('usage-sync').textContent = `Backend sync failed: ${error.message}.`;
+        }
+      };
+
+      document.querySelectorAll('[data-copy]').forEach((button) => {
+        button.addEventListener('click', async () => {
+          await navigator.clipboard.writeText(button.dataset.copy);
+          button.textContent = 'Copied';
+          setTimeout(() => button.textContent = 'Copy', 1200);
+        });
+      });
+      if (themeButton) {
+        themeButton.addEventListener('click', () => {
+          applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark');
+        });
+      }
+      
+      const tabBtns = document.querySelectorAll('.tab-btn');
+      const tabPanels = document.querySelectorAll('.tab-panel');
+      
+      const activateTab = (tabId) => {
+        tabBtns.forEach(b => b.classList.remove('active'));
+        tabPanels.forEach(p => p.style.display = 'none');
+        const btn = Array.from(tabBtns).find(b => b.dataset.tab === tabId);
+        if (btn) btn.classList.add('active');
+        const panel = document.getElementById(tabId);
+        if (panel) panel.style.display = 'block';
+      };
+      
+      tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+          if (window.location.pathname !== '/') {
+            window.location.href = '/';
+            return;
+          }
+          activateTab(btn.dataset.tab);
+        });
+      });
+      
+      if (window.location.search.includes('saved=1') || window.location.search.includes('error=')) {
+         activateTab('tab-settings');
+      }
+      
+      const list = document.getElementById('account-setup-list');
+      const count = document.getElementById('account-count');
+      const addAccountBtn = document.getElementById('add-account');
+      if (addAccountBtn) {
+        addAccountBtn.addEventListener('click', () => {
+          const index = Number(count.value) + 1;
+          count.value = String(index);
+          list.insertAdjacentHTML('beforeend', `
+            <details open>
+              <summary>Cloudflare Account #${index}</summary>
+              <div class="field-grid">
+                <label>Name <input name="name_${index}" placeholder="e.g. user@gmail.com" autocomplete="off"></label>
+                <label>Account ID <input name="account_id_${index}" autocomplete="off" placeholder="Cloudflare account ID"></label>
+                <label>API Token <input name="api_token_${index}" type="password" autocomplete="off" placeholder="Cloudflare API token"></label>
+              </div>
+            </details>`);
+        });
+      }
+      
+      refreshUsage();
+      setInterval(refreshUsage, 5000);
+    </script>"""
+
+
+def _account_bars(snapshots: list[tuple[CloudflareAccount, dict[str, object]]]) -> str:
+    if not snapshots:
+        return '<div class="chart-empty">Add accounts to see token distribution.</div>'
+    max_tokens = max((int(item["total_tokens"]) for _, item in snapshots), default=0) or 1
+    return "".join(
+        f"""
+        <div class="bar-row">
+          <div class="bar-label">
+            <b>{escape(account.name)}</b>
+            <span>{_format_int(int(item['total_tokens']))} tokens</span>
+          </div>
+          <div class="bar-track">
+            <i class="bar-fill fill-{index % 4}" style="width: {max(2, int((int(item['total_tokens']) / max_tokens) * 100))}%"></i>
+          </div>
+        </div>
+        """
+        for index, (account, item) in enumerate(snapshots)
+    )
+
+
+def _request_mix_bars(total_requests: int, total_unknown: int) -> str:
+    known = max(0, total_requests - total_unknown)
+    maximum = max(known, total_unknown, 1)
+    rows = [("Known", known, "fill-0"), ("Unknown", total_unknown, "fill-3")]
+    return "".join(
+        f"""
+        <div class="spark-row">
+          <span>{label}</span>
+          <i><b class="{fill}" style="height:{max(8, int((value / maximum) * 100))}%"></b></i>
+          <strong>{_format_int(value)}</strong>
+        </div>
+        """
+        for label, value, fill in rows
+    )
+
+
+def _composition_chart(snapshots: list[tuple[CloudflareAccount, dict[str, object]]]) -> str:
+    prompt = sum(int(item["prompt_tokens"]) for _, item in snapshots)
+    completion = sum(int(item["completion_tokens"]) for _, item in snapshots)
+    total = max(prompt + completion, 1)
+    prompt_width = max(2, int((prompt / total) * 100))
+    completion_width = max(2, int((completion / total) * 100))
+    return f"""
+    <div class="composition-stack">
+      <i class="fill-1" style="width:{prompt_width}%"></i>
+      <i class="fill-2" style="width:{completion_width}%"></i>
+    </div>
+    <div class="composition-meta">
+      <span>Prompt <b>{_format_int(prompt)}</b></span>
+      <span>Completion <b>{_format_int(completion)}</b></span>
+    </div>
+    """
+
+
+def _quota_rings(snapshots: list[tuple[CloudflareAccount, dict[str, object]]]) -> str:
+    if not snapshots:
+        return '<div class="chart-empty">No account quota data yet.</div>'
+    return "".join(
+        f"""
+        <div class="ring-chip">
+          <svg viewBox="0 0 42 42" aria-label="{escape(account.name)} quota">
+            <circle class="ring-track" cx="21" cy="21" r="15"></circle>
+            <circle class="ring-value fill-stroke-{index % 4}" cx="21" cy="21" r="15" style="stroke-dasharray:{_usage_percent(account, item)} 100"></circle>
+          </svg>
+          <span><b>{_usage_percent(account, item)}%</b>{escape(account.name)}</span>
+        </div>
+        """
+        for index, (account, item) in enumerate(snapshots[:6])
     )
 
 
 def _account_setup_block(index: int, account: CloudflareAccount) -> str:
-    token_limit = "" if account.token_limit is None else str(account.token_limit)
-    reset_period_hours = "" if account.reset_period_hours is None else str(account.reset_period_hours)
     return f"""
     <details {'open' if index == 1 else ''}>
       <summary>Cloudflare Account #{index}</summary>
       <div class="field-grid">
-        <label>Name <input name="name_{index}" value="{escape(account.name)}" autocomplete="off"></label>
+        <label>Name <input name="name_{index}" value="{escape(account.name)}" placeholder="e.g. user@gmail.com" autocomplete="off"></label>
         <label>Account ID <input name="account_id_{index}" value="{escape(account.account_id)}" autocomplete="off" placeholder="Cloudflare account ID"></label>
         <label>API Token <input name="api_token_{index}" value="{escape(account.api_token)}" type="password" autocomplete="off" placeholder="Cloudflare API token"></label>
-        <label>Token Limit <input name="token_limit_{index}" value="{escape(token_limit)}" inputmode="numeric" autocomplete="off" placeholder="Optional, e.g. 10000000"></label>
-        <label>Reset Hours <input name="reset_period_hours_{index}" value="{escape(reset_period_hours)}" inputmode="numeric" autocomplete="off" placeholder="Optional, e.g. 24"></label>
       </div>
     </details>
     """
 
 
-def _codex_shell(title: str, subtitle: str, body: str) -> str:
-    return f"""<!doctype html>
+def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compact-shell") -> str:
+    shell = """<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(title)}</title>
+  <title>__TITLE__</title>
   <style>
-    :root {{ color-scheme: dark; --bg: #03060d; --panel: #0d121c; --panel-2: #111722; --line: #202a3b; --text: #e7edf7; --muted: #8b94a3; --blue: #5790ff; --blue-2: #2d6df6; --red: #ff5d6c; --green: #55d686; --orange: #f59e0b; }}
-    * {{ box-sizing: border-box; }}
-    html {{ min-height: 100%; background: var(--bg); }}
-    body {{ margin: 0; min-height: 100vh; color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: radial-gradient(circle at 50% 42%, rgba(23, 42, 72, .54), transparent 30rem), radial-gradient(circle at 50% 120%, rgba(7, 28, 62, .52), transparent 28rem), linear-gradient(135deg, #050812 0%, #03060d 52%, #070a11 100%); }}
-    body::before {{ content: ""; position: fixed; inset: 0; pointer-events: none; background: linear-gradient(rgba(255,255,255,.015) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.012) 1px, transparent 1px); background-size: 64px 64px; mask-image: radial-gradient(circle at center, black, transparent 72%); }}
-    main {{ min-height: 100vh; display: grid; place-items: center; padding: 32px 16px; }}
-    .wrap {{ width: min(720px, 100%); }}
-    .brand {{ display: grid; justify-items: center; gap: 10px; margin-bottom: 32px; text-align: center; }}
-    .logo {{ width: 64px; height: 64px; display: grid; place-items: center; border: 1px solid #1c3159; border-radius: 19px; background: linear-gradient(180deg, rgba(26,43,74,.58), rgba(8,13,23,.9)); box-shadow: inset 0 0 0 3px rgba(0,0,0,.32); }}
-    .terminal {{ width: 31px; height: 31px; border: 3px solid var(--blue); border-radius: 50%; position: relative; }}
-    .terminal::before {{ content: ">"; position: absolute; left: 6px; top: 3px; color: var(--blue); font: 800 16px/1 ui-monospace, SFMono-Regular, Consolas, monospace; }}
-    .terminal::after {{ content: ""; position: absolute; right: 7px; bottom: 8px; width: 7px; height: 2px; border-radius: 999px; background: var(--blue); }}
-    h1 {{ margin: 0; font-size: 20px; line-height: 1.1; letter-spacing: -.02em; }}
-    .subtitle {{ margin: 0; color: var(--muted); font-size: 14px; }}
-    .card {{ border: 1px solid var(--line); border-radius: 17px; padding: 25px; background: linear-gradient(180deg, rgba(16, 23, 35, .94), rgba(10, 15, 24, .96)); }}
-    h2 {{ margin: 0 0 10px; font-size: 17px; letter-spacing: -.02em; }}
-    p {{ margin: 0; }}
-    .muted {{ color: var(--muted); font-size: 14px; line-height: 1.55; }}
-    .stack {{ display: grid; gap: 16px; margin-top: 20px; }}
-    label {{ display: grid; gap: 8px; color: var(--text); font-size: 12px; font-weight: 700; }}
-    input {{ width: 100%; height: 38px; border: 1px solid #293449; border-radius: 8px; padding: 0 12px; background: #121822; color: var(--text); font: 500 14px/1 inherit; outline: none; }}
-    input:focus {{ border-color: var(--blue); box-shadow: 0 0 0 3px rgba(87, 144, 255, .14); }}
-    input::placeholder {{ color: #798393; }}
-    details {{ border: 1px solid #202a3b; border-radius: 11px; background: rgba(7, 11, 18, .38); overflow: hidden; }}
-    summary {{ cursor: pointer; padding: 13px 14px; color: #d8e0ec; font-size: 13px; font-weight: 800; }}
-    .field-grid {{ display: grid; gap: 12px; padding: 0 14px 14px; }}
-    #account-list {{ display: grid; gap: 12px; }}
-    .button {{ display: inline-flex; align-items: center; justify-content: center; min-height: 36px; border: 0; border-radius: 8px; padding: 0 14px; background: var(--blue); color: #061124; font-size: 14px; font-weight: 800; text-decoration: none; cursor: pointer; }}
-    .button:hover {{ background: #69a0ff; }}
-    .button.secondary {{ border: 1px solid #293449; background: #121822; color: var(--text); }}
-    .notice {{ margin-top: 18px; padding: 12px 14px; border-radius: 9px; font-size: 13px; font-weight: 700; }}
-    .success {{ border: 1px solid rgba(85,214,134,.32); background: rgba(85,214,134,.1); color: var(--green); }}
-    .error {{ border: 1px solid rgba(255,93,108,.34); background: rgba(255,93,108,.12); color: var(--red); }}
-    code {{ color: #dbe7ff; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; word-break: break-all; }}
-    .copyline {{ display: flex; align-items: center; min-height: 38px; border: 1px solid #293449; border-radius: 8px; padding: 0 12px; background: #121822; }}
-    .panel-head {{ display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }}
-    .status {{ border-radius: 999px; padding: 6px 9px; font-size: 12px; font-weight: 800; white-space: nowrap; }}
-    .status-ok {{ color: var(--green); background: rgba(85,214,134,.1); }}
-    .status-warn {{ color: var(--orange); background: rgba(245,158,11,.1); }}
-    .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }}
-    .stats div {{ border: 1px solid #202a3b; border-radius: 10px; padding: 10px; background: rgba(7,11,18,.38); }}
-    .stats b {{ display: block; font-size: 18px; }}
-    .stats span {{ color: var(--muted); font-size: 11px; }}
-    .accounts {{ display: grid; gap: 8px; }}
-    .account-row {{ display: flex; justify-content: space-between; gap: 12px; border: 1px solid #202a3b; border-radius: 10px; padding: 10px 12px; background: rgba(7,11,18,.38); font-size: 13px; }}
-    .account-card {{ display: grid; gap: 12px; border: 1px solid #202a3b; border-radius: 12px; padding: 13px; background: rgba(7,11,18,.38); }}
-    .account-top {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; font-size: 13px; }}
-    .account-top div {{ display: grid; gap: 4px; }}
-    .account-top span {{ color: #dbe7ff; font-weight: 800; white-space: nowrap; }}
-    .meter {{ height: 7px; overflow: hidden; border-radius: 999px; background: #111827; }}
-    .meter i {{ display: block; height: 100%; border-radius: inherit; background: var(--blue); }}
-    .quota-grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }}
-    .quota-grid span {{ display: grid; gap: 3px; color: var(--muted); font-size: 11px; }}
-    .quota-grid b {{ color: var(--text); font-size: 13px; }}
-    .hint {{ color: var(--muted); font-size: 12px; line-height: 1.45; }}
-    .actions {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
-    .footnote {{ margin-top: 16px; color: var(--muted); font-size: 13px; text-align: center; }}
-    a {{ color: #83aeff; }}
-    @media (max-width: 560px) {{ .card {{ padding: 20px; }} .actions, .stats, .quota-grid {{ grid-template-columns: 1fr; }} .account-top {{ display: grid; }} }}
+    :root {
+      color-scheme: light;
+      --bg: oklch(0.965 0.006 255);
+      --bg-rail: oklch(0.94 0.008 255);
+      --panel: oklch(0.99 0.002 255);
+      --panel-raised: oklch(1 0 0);
+      --line: oklch(0.86 0.012 255);
+      --line-strong: oklch(0.74 0.025 255);
+      --text: oklch(0.22 0.018 255);
+      --muted: oklch(0.43 0.024 255);
+      --quiet: oklch(0.54 0.02 255);
+      --accent: oklch(0.55 0.14 245);
+      --accent-ink: oklch(0.99 0.002 255);
+      --warn: oklch(0.58 0.13 76);
+      --danger: oklch(0.56 0.18 24);
+      --success: oklch(0.48 0.14 152);
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    :root[data-theme="dark"] {
+      color-scheme: dark;
+      --bg: oklch(0.145 0.012 255);
+      --bg-rail: oklch(0.18 0.015 255);
+      --panel: oklch(0.205 0.014 255);
+      --panel-raised: oklch(0.24 0.016 255);
+      --line: oklch(0.34 0.018 255);
+      --line-strong: oklch(0.43 0.022 255);
+      --text: oklch(0.955 0.006 255);
+      --muted: oklch(0.72 0.018 255);
+      --quiet: oklch(0.58 0.02 255);
+      --accent: oklch(0.76 0.13 188);
+      --accent-ink: oklch(0.16 0.018 210);
+      --warn: oklch(0.78 0.14 76);
+      --danger: oklch(0.72 0.18 24);
+      --success: oklch(0.76 0.14 152);
+    }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+    body { font-family: var(--sans); font-size: 14px; line-height: 1.45; }
+    body::before, body::after { content: none !important; display: none !important; }
+    a { color: inherit; }
+    code { font-family: var(--mono); }
+    main { min-height: 100vh; padding: 20px; background: var(--bg); }
+    .wrap { width: min(1120px, 100%); margin: 0 auto; }
+    .wrap.dashboard-shell { width: min(1120px, 100%); }
+    .card, .dashboard-section, .chart-panel, .mini-chart-panel, .endpoint-panel, .quota-panel, .account-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 20px;
+    }
+    .dashboard-shell > .card { padding: 0; background: transparent; border: 0; border-radius: 0; }
+    .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
+    .logo { width: 36px; height: 36px; display: grid; place-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+    .terminal { width: 14px; height: 10px; border: 1px solid var(--accent); border-radius: 3px; }
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 2px; font-size: 20px; letter-spacing: -0.02em; }
+    h2 { margin-bottom: 10px; font-size: 22px; letter-spacing: -0.02em; }
+    h3 { margin-bottom: 0; font-size: 14px; font-weight: 650; letter-spacing: -0.01em; }
+    .subtitle, .muted, .footnote { color: var(--muted); }
+    .dashboard-shell .brand { display: none; }
+    .top-nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 12px 20px;
+      background: var(--bg);
+      border-bottom: 1px solid var(--line);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .nav-brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .nav-brand b {
+      font-size: 15px;
+      font-weight: 650;
+      letter-spacing: -0.01em;
+    }
+    .tab-pills {
+      display: flex;
+      align-items: center;
+      background: var(--bg-rail);
+      padding: 4px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+    }
+    .tab-btn {
+      background: transparent;
+      border: none;
+      border-radius: 999px;
+      padding: 6px 16px;
+      font: 500 13px/1 var(--sans);
+      color: var(--muted);
+      cursor: pointer;
+      transition: all 150ms ease;
+    }
+    .tab-btn:hover {
+      color: var(--text);
+    }
+    .tab-btn.active {
+      background: var(--panel);
+      color: var(--text);
+      font-weight: 600;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    }
+    .nav-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .dashboard-hero {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 18px;
+      margin-bottom: 24px;
+    }
+    .dashboard-hero h2 { margin: 0 0 4px; font-size: 24px; font-weight: 700; letter-spacing: -0.03em; text-wrap: balance; }
+    .dashboard-hero p { margin: 0; max-width: 72ch; color: var(--muted); }
+    .hero-actions { display: flex; align-items: center; gap: 10px; }
+    .status, .account-status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      white-space: nowrap;
+      border: 1px solid color-mix(in oklch, var(--success), var(--line) 40%);
+      border-radius: 999px;
+      padding: 5px 10px;
+      color: var(--success);
+      background: color-mix(in oklch, var(--success) 14%, var(--panel));
+      font-size: 12px;
+      font-weight: 650;
+    }
+    .status::before, .account-status::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
+    .status-warn { color: var(--warn); background: color-mix(in oklch, var(--warn) 14%, var(--panel)); border-color: color-mix(in oklch, var(--warn), var(--line) 40%); }
+    .dashboard-section, .stats, .chart-grid, .mini-chart-grid { margin-bottom: 16px; }
+    .section-title { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; margin-bottom: 16px; }
+    .section-title span { color: var(--quiet); font-size: 12px; }
+    .accounts { display: grid; grid-template-columns: repeat(auto-fit, minmax(315px, 1fr)); gap: 12px; }
+    .account-card { padding: 16px; background: var(--bg-rail); }
+    .account-top { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+    .account-top b { display: block; margin-bottom: 2px; font-size: 14px; }
+    .account-top code { color: var(--quiet); font-size: 12px; }
+    .account-total, .quota-total { display: flex; flex-direction: column; gap: 2px; margin-bottom: 14px; }
+    .account-total strong, .quota-total strong, .stats b, .donut-center b {
+      font-family: var(--mono);
+      font-weight: 650;
+      letter-spacing: -0.04em;
+      color: var(--text);
+    }
+    .account-total strong { font-size: 28px; line-height: 1; }
+    .quota-total strong { font-size: 34px; line-height: 1; }
+    .account-total span, .quota-total span { color: var(--muted); font-size: 12px; }
+    .quota-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; margin: 14px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--line); }
+    .quota-grid span { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 10px; background: var(--panel); color: var(--quiet); font-size: 11px; }
+    .quota-grid b { overflow: hidden; color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; text-overflow: ellipsis; }
+    .account-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 14px; color: var(--quiet); font-size: 12px; }
+    .account-foot b { color: var(--muted); font-weight: 600; }
+    .meter { height: 8px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+    .meter i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 180ms ease-out; }
+    .meter.large { height: 10px; margin-top: 14px; }
+    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .stats div { padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .stats b { display: block; margin-bottom: 4px; font-size: 26px; line-height: 1; }
+    .stats span { color: var(--muted); font-size: 12px; }
+    .chart-grid { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr); gap: 12px; }
+    .mini-chart-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .donut-wrap { position: relative; display: grid; place-items: center; min-height: 198px; }
+    .donut { width: min(178px, 100%); transform: rotate(-90deg); overflow: visible; }
+    .donut-track { stroke: var(--bg); stroke-width: 14; fill: none; }
+    .donut-value { stroke: var(--accent); stroke-width: 14; fill: none; stroke-linecap: round; transition: stroke-dasharray 180ms ease-out; }
+    .donut-center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; }
+    .donut-center b { font-size: 32px; }
+    .donut-center span { color: var(--quiet); font-size: 12px; }
+    .chart-legend { display: flex; justify-content: center; gap: 16px; color: var(--muted); font-size: 12px; }
+    .chart-legend span { display: inline-flex; align-items: center; gap: 7px; }
+    .chart-legend i { width: 8px; height: 8px; border-radius: 999px; }
+    .legend-used { background: var(--accent); }
+    .legend-left { background: var(--line-strong); }
+    .bar-chart { display: flex; flex-direction: column; gap: 14px; }
+    .bar-row { display: grid; gap: 7px; }
+    .bar-label { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
+    .bar-label b { color: var(--text); font-weight: 600; }
+    .bar-track { height: 9px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+    .bar-fill { display: block; height: 100%; border-radius: inherit; }
+    .fill-0, .fill-1, .fill-2, .fill-3 { background: var(--accent); }
+    .fill-1 { background: var(--warn); }
+    .fill-2 { background: oklch(0.72 0.12 260); }
+    .fill-3 { background: var(--danger); }
+    .spark-bars { display: flex; align-items: flex-end; justify-content: center; gap: 28px; min-height: 128px; }
+    .spark-row { display: grid; grid-template-rows: auto 1fr auto; align-items: end; justify-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .spark-row i { width: 28px; height: 88px; display: flex; align-items: flex-end; padding: 2px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+    .spark-row b { width: 100%; border-radius: 5px; }
+    .spark-row strong { color: var(--text); font-family: var(--mono); font-size: 12px; }
+    .composition-stack { display: flex; height: 12px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+    .composition-stack i { display: block; height: 100%; }
+    .composition-meta, .endpoint-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+    .composition-meta span, .endpoint-meta span { flex: 1 1 130px; min-width: 0; padding: 10px 12px; background: var(--bg-rail); border: 1px solid var(--line); border-radius: 10px; color: var(--quiet); font-size: 12px; }
+    .composition-meta b, .endpoint-meta b { display: block; overflow: hidden; margin-top: 2px; color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; text-overflow: ellipsis; }
+    .radar-rings { display: flex; flex-wrap: wrap; gap: 10px; }
+    .ring-chip { display: flex; align-items: center; gap: 10px; min-width: 132px; padding: 10px; background: var(--bg-rail); border: 1px solid var(--line); border-radius: 10px; }
+    .ring-chip svg { width: 42px; height: 42px; flex: 0 0 auto; transform: rotate(-90deg); }
+    .ring-track { stroke: var(--bg); stroke-width: 6; fill: none; }
+    .ring-value { stroke-width: 6; fill: none; stroke-linecap: round; }
+    .fill-stroke-0 { stroke: var(--accent); }
+    .fill-stroke-1 { stroke: var(--warn); }
+    .fill-stroke-2 { stroke: oklch(0.72 0.12 260); }
+    .fill-stroke-3 { stroke: var(--danger); }
+    .ring-chip span { min-width: 0; color: var(--quiet); font-size: 12px; }
+    .ring-chip b { display: block; color: var(--text); font-family: var(--mono); font-size: 13px; }
+    .endpoint-panel label { display: block; color: var(--muted); font-size: 12px; }
+    .copyline { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
+    .copyline code { flex: 1; min-width: 0; overflow: auto; padding: 0 8px; color: var(--text); font-size: 13px; white-space: nowrap; }
+    .button, .copyline button, button[type="submit"], .theme-toggle { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; border: 1px solid color-mix(in oklch, var(--accent), var(--line) 30%); border-radius: 9px; padding: 8px 13px; background: var(--accent); color: var(--accent-ink); font: 650 13px/1 var(--sans); text-decoration: none; cursor: pointer; transition: background-color 160ms ease-out, border-color 160ms ease-out, transform 160ms ease-out; }
+    .button:hover, .copyline button:hover, button[type="submit"]:hover, .theme-toggle:hover { background: color-mix(in oklch, var(--accent), white 14%); }
+    .button:active, .copyline button:active, button[type="submit"]:active, .theme-toggle:active { transform: translateY(1px); }
+    .button.secondary { background: var(--panel-raised); color: var(--text); border-color: var(--line-strong); }
+    .button.secondary:hover { background: var(--bg-rail); }
+    .theme-toggle { background: var(--panel); color: var(--text); border-color: var(--line-strong); }
+    .info-strip { display: flex; justify-content: space-between; align-items: center; gap: 18px; padding: 16px 0 0; color: var(--muted); }
+    .info-strip p { max-width: 76ch; margin: 0; font-size: 12px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; }
+    .empty-state, .chart-empty { padding: 24px; border: 1px dashed var(--line-strong); border-radius: 12px; background: var(--bg-rail); color: var(--muted); }
+    .empty-state b { display: block; margin-bottom: 6px; color: var(--text); }
+    .empty-state p { margin-bottom: 16px; }
+    .stack { display: grid; gap: 14px; }
+    #account-list { display: grid; gap: 12px; }
+    details { background: var(--bg-rail); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+    summary { cursor: pointer; font-weight: 650; }
+    .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
+    label { color: var(--muted); font-size: 12px; }
+    input { width: 100%; margin-top: 6px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 11px; background: var(--bg); color: var(--text); font: 13px/1.2 var(--sans); }
+    input::placeholder { color: oklch(0.62 0.018 255); }
+    .notice { margin: 14px 0; padding: 12px; border-radius: 10px; border: 1px solid var(--line); }
+    .notice.success { color: var(--success); background: oklch(0.24 0.035 152 / 0.5); border-color: oklch(0.48 0.08 152); }
+    .notice.error { color: var(--danger); background: oklch(0.24 0.035 24 / 0.5); border-color: oklch(0.48 0.1 24); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    @media (max-width: 920px) {
+      main { padding: 14px; }
+      .dashboard-hero, .info-strip { flex-direction: column; align-items: stretch; }
+      .stats, .chart-grid, .mini-chart-grid { grid-template-columns: 1fr; }
+      .quota-grid, .field-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 560px) {
+      main { padding: 12px; }
+      .card, .dashboard-section, .chart-panel, .mini-chart-panel, .endpoint-panel, .quota-panel { padding: 16px; }
+      .accounts { grid-template-columns: 1fr; }
+      .quota-grid, .field-grid { grid-template-columns: 1fr; }
+      .copyline { align-items: stretch; flex-direction: column; }
+      .copyline code { width: 100%; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; }
+    }
+
   </style>
 </head>
 <body>
+  <nav class="top-nav">
+    <div class="nav-brand">
+      <div class="logo"><div class="terminal"></div></div>
+      <b>__TITLE__</b>
+    </div>
+    <div class="tab-pills">
+      <button type="button" class="tab-btn active" data-tab="tab-dashboard">Dashboard</button>
+      <button type="button" class="tab-btn" data-tab="tab-accounts">Accounts</button>
+      <button type="button" class="tab-btn" data-tab="tab-settings">Settings</button>
+    </div>
+    <div class="nav-right">
+      <button class="theme-toggle" type="button" id="theme-toggle" aria-label="Switch color theme">Dark theme</button>
+    </div>
+  </nav>
   <main>
-    <div class="wrap">
-      <div class="brand">
-        <div class="logo"><div class="terminal"></div></div>
-        <div>
-          <h1>{escape(title)}</h1>
-          <p class="subtitle">{escape(subtitle)}</p>
-        </div>
-      </div>
-      <div class="card">{body}</div>
+    <div class="wrap __SHELL_CLASS__">
+      <div class="card">__BODY__</div>
     </div>
   </main>
 </body>
 </html>"""
+    return (
+        shell.replace("__TITLE__", escape(title))
+        .replace("__SUBTITLE__", escape(subtitle))
+        .replace("__SHELL_CLASS__", escape(shell_class))
+        .replace("__BODY__", body)
+    )
 
 
 def _form_value(form: dict[str, list[str]], key: str) -> str:
@@ -568,6 +1232,22 @@ def _format_reset(reset_at: object) -> str:
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+def _format_time_ago(timestamp: object) -> str:
+    if timestamp is None:
+        return "Never"
+    seconds = max(0, int(time.time() - float(timestamp)))
+    if seconds < 60:
+        return "Just now"
+    minutes, seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m ago"
+    days = hours // 24
+    return f"{days}d ago"
 
 
 def _usage_percent(account: CloudflareAccount, item: dict[str, object]) -> int:

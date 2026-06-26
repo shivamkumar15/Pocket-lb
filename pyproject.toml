@@ -1,7 +1,7 @@
 [project]
 name = "glmllb"
 version = "0.1.0"
-description = "Local Cloudflare Workers AI account load balancer for OpenCode-compatible clients."
+description = "Local Cloudflare Workers AI account load balancer for OpenAI-compatible clients."
 requires-python = ">=3.11"
 dependencies = [
   "fastapi>=0.111.0",

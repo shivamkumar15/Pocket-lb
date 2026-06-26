@@ -32,6 +32,7 @@ class Settings:
     request_timeout_seconds: float
     max_attempts: int
     accounts: list[CloudflareAccount]
+    model_mapping: dict[str, str]
 
 
 def load_settings(config_path: str | None = None) -> Settings:
@@ -57,10 +58,16 @@ def load_settings(config_path: str | None = None) -> Settings:
     return Settings(
         config_path=path,
         host=str(os.getenv("GLMLLB_HOST") or raw.get("host") or "127.0.0.1"),
-        port=int(os.getenv("GLMLLB_PORT") or raw.get("port") or "2455"),
+        port=int(os.getenv("GLMLLB_PORT") or raw.get("port") or "2456"),
         request_timeout_seconds=float(os.getenv("GLMLLB_TIMEOUT") or raw.get("request_timeout_seconds") or "120"),
         max_attempts=max(1, int(os.getenv("GLMLLB_MAX_ATTEMPTS") or raw.get("max_attempts") or str(len(accounts)))),
         accounts=accounts,
+        model_mapping=dict(raw.get("model_mapping") or {
+            "glm5.2": "@cf/meta/llama-3-8b-instruct",
+            "gpt-4o": "@cf/meta/llama-3-8b-instruct",
+            "gpt-4o-mini": "@cf/meta/llama-3-8b-instruct",
+            "claude-3-5-sonnet-20241022": "@cf/meta/llama-3-8b-instruct"
+        }),
     )
 
 
