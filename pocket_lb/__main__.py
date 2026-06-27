@@ -1,4 +1,4 @@
-from glmllb.proxy import main
+from pocket_lb.proxy import main
 
 
 if __name__ == "__main__":

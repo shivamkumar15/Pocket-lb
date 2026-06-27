@@ -1,5 +1,5 @@
 [project]
-name = "glmllb"
+name = "pocket-lb"
 version = "0.1.0"
 description = "Local Cloudflare Workers AI account load balancer for OpenAI-compatible clients."
 requires-python = ">=3.11"
@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [project.scripts]
-glmllb = "glmllb.proxy:main"
+pocket-lb = "pocket_lb.proxy:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -1,11 +1,11 @@
-# glmllb
+# Pocket-lb
 
 A local load-balancing proxy for [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/) that exposes an OpenAI-compatible API. Round-robin across multiple Cloudflare accounts, auto-retry on rate limits, track token usage, and manage everything from a built-in web dashboard.
 
 ```text
 OpenCode / Cline / Aider / any OpenAI-compatible client
   -> http://localhost:2456/v1
-  -> glmllb proxy (round-robin + retry + usage tracking)
+  -> Pocket-lb proxy (round-robin + retry + usage tracking)
   -> Cloudflare Account #1
   -> Cloudflare Account #2
   -> Cloudflare Account #3
@@ -30,43 +30,70 @@ https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/*
 - **Local-first security** — credentials are stored only in local `config.json` (git-ignored).
 - **Docker support** — ships with a `Dockerfile` and `docker-compose.yml`.
 
-## Quick Start
+## Installation & Setup Guide
 
-### Prerequisites
+Follow these steps to get Pocket-lb running locally.
 
-- Python 3.11+
+### Method 1: Local Python Installation
 
-### Install
+**Step 1: Clone the repository**
+```bash
+git clone https://github.com/shivamkumar15/Pocket-lb.git
+cd Pocket-lb
+```
 
+**Step 2: Create a virtual environment**
+Ensure you have Python 3.11 or newer installed.
 ```bash
 python -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate  # On Windows use: .venv\Scripts\activate
+```
+
+**Step 3: Install the package**
+```bash
 pip install -e .
 ```
 
-### Run
-
+**Step 4: Start the server**
 ```bash
-glmllb
+pocket-lb
 ```
 
-Then open the setup page in your browser:
+**Step 5: Configure your Cloudflare accounts**
+1. Open your browser and navigate to [http://localhost:2456/setup](http://localhost:2456/setup).
+2. Enter your Cloudflare Account ID and API Token. You can generate an API token from your Cloudflare dashboard (ensure it has "Workers AI" permissions).
+3. *(Optional)* Set token limits and reset windows to track your quota.
+4. Click "Save". This will securely create a local `config.json` file.
 
-```text
-http://localhost:2456/setup
+**Step 6: Restart to apply changes**
+Stop the server in your terminal (`Ctrl+C`) and start it again to load the new configuration:
+```bash
+pocket-lb
 ```
 
-Enter your Cloudflare account IDs and API tokens. You can add as many accounts as you want. Optional token limits and reset windows can be saved per account so the dashboard can estimate remaining quota and reset timing.
+### Method 2: Docker Setup
 
-Restart `glmllb` after saving to reload the new accounts.
+If you prefer using Docker, you can run Pocket-lb without installing Python dependencies.
 
-### Docker
+**Step 1: Create a configuration file**
+First, create an empty `config.json` file in the root directory (this allows Docker to mount the file instead of creating a directory):
+```bash
+echo "{}" > config.json
+```
 
+**Step 2: Start the container**
 ```bash
 docker-compose up -d
 ```
 
-The container exposes port `2456` and mounts your local `config.json`.
+**Step 3: Configure your accounts**
+Visit [http://localhost:2456/setup](http://localhost:2456/setup) in your browser, add your Cloudflare credentials, and save.
+
+**Step 4: Restart the container**
+Apply your configuration by restarting the Docker container:
+```bash
+docker-compose restart pocket-lb
+```
 
 ## Endpoints
 
@@ -96,7 +123,7 @@ Point any OpenAI-compatible tool at:
 
 ```text
 Base URL: http://localhost:2456/v1
-API key: any non-empty value (e.g. glmllb-local)
+API key: any non-empty value (e.g. pocket-lb-local)
 ```
 
 The local API key is not used for Cloudflare authentication. Cloudflare credentials come from `config.json` or the `CLOUDFLARE_ACCOUNTS` environment variable.
@@ -126,7 +153,7 @@ Choose the OpenAI-compatible/custom provider and set:
 
 ```text
 Base URL: http://localhost:2456/v1
-API key: glmllb-local
+API key: pocket-lb-local
 Model: gpt-4o (or any mapped model name)
 ```
 
@@ -165,8 +192,8 @@ Instead of `config.json`, you can configure accounts via environment:
 
 ```bash
 export CLOUDFLARE_ACCOUNTS='account_id_1:token_1,account_id_2:token_2,account_id_3:token_3'
-export GLMLLB_PORT=2456
-glmllb
+export POCKET_LB_PORT=2456
+pocket-lb
 ```
 
 ## Behavior
@@ -174,7 +201,7 @@ glmllb
 - Round-robins requests across configured accounts.
 - Retries another account on `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`.
 - Preserves streaming responses (SSE) and extracts token usage from stream chunks.
-- Adds `x-glmllb-account` header to responses so you can see which account handled a request.
+- Adds `x-pocket-lb-account` header to responses so you can see which account handled a request.
 - Token counts are local observations from provider `usage` fields. Non-streaming responses and streaming responses with usage data are tracked; providers that omit usage are counted as unknown-token responses.
 - Keeps `config.json` git-ignored so secrets are never committed.
 
@@ -194,8 +221,8 @@ The dashboard auto-refreshes usage data from the backend.
 ## Project Structure
 
 ```text
-glmllb/
-├── glmllb/
+Pocket-lb/
+├── pocket_lb/
 │   ├── __init__.py
 │   ├── __main__.py
 │   ├── config.py        # Settings dataclass, config loading

@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  glmllb:
+  pocket-lb:
     build: .
-    container_name: glmllb
+    container_name: pocket-lb
     restart: unless-stopped
     ports:
       - "2456:2456"

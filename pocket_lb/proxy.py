@@ -13,7 +13,7 @@ import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 
-from glmllb.config import CloudflareAccount, Settings, load_settings
+from pocket_lb.config import CloudflareAccount, Settings, load_settings
 
 
 RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
@@ -143,7 +143,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         finally:
             await client.aclose()
 
-    app = FastAPI(title="glmllb", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="Pocket-LB", version="0.1.0", lifespan=lifespan)
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(saved: bool = False, error: str | None = None) -> str:
@@ -314,7 +314,7 @@ def _response_headers(response: httpx.Response, account_name: str) -> dict[str, 
         for key, value in response.headers.items()
         if key.lower() not in HOP_BY_HOP_HEADERS
     }
-    headers["x-glmllb-account"] = account_name
+    headers["x-pocket-lb-account"] = account_name
     return headers
 
 
@@ -598,13 +598,13 @@ def _dashboard_script() -> str:
       const themeButton = $('theme-toggle');
       const applyTheme = (theme) => {
         document.documentElement.dataset.theme = theme;
-        localStorage.setItem('glmllb-theme', theme);
+        localStorage.setItem('pocket-lb-theme', theme);
         if (themeButton) {
           themeButton.textContent = theme === 'dark' ? 'Light theme' : 'Dark theme';
           themeButton.setAttribute('aria-label', `Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`);
         }
       };
-      applyTheme(localStorage.getItem('glmllb-theme') || 'light');
+      applyTheme(localStorage.getItem('pocket-lb-theme') || 'light');
       const formatInt = (value) => Number(value || 0).toLocaleString();
       const formatOptionalInt = (value) => value === null || value === undefined ? 'Not set' : formatInt(value);
       const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
@@ -1277,7 +1277,7 @@ def _mask_account_id(account_id: str) -> str:
 
 def main() -> None:
     settings = load_settings()
-    uvicorn.run("glmllb.proxy:create_app", host=settings.host, port=settings.port, factory=True)
+    uvicorn.run("pocket_lb.proxy:create_app", host=settings.host, port=settings.port, factory=True)
 
 
 if __name__ == "__main__":

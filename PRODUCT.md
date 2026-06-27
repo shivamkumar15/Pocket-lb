@@ -10,7 +10,7 @@ Developers running OpenCode against Cloudflare Workers AI through a local load-b
 
 ## Product Purpose
 
-glmllb provides a local OpenAI-compatible endpoint that rotates requests across multiple Cloudflare accounts, retries failed or rate-limited accounts, and keeps Cloudflare credentials on the local machine. Success means a developer can confidently configure accounts, point OpenCode at one URL, and understand account health and observed quota usage without reading logs.
+Pocket-lb provides a local OpenAI-compatible endpoint that rotates requests across multiple Cloudflare accounts, retries failed or rate-limited accounts, and keeps Cloudflare credentials on the local machine. Success means a developer can confidently configure accounts, point OpenCode at one URL, and understand account health and observed quota usage without reading logs.
 
 ## Brand Personality
 
