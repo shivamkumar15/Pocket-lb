@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from pocket_lb.config import CloudflareAccount, Settings, load_settings
 
 
-RETRY_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+RETRY_STATUSES = {408, 409, 410, 425, 429, 500, 502, 503, 504}
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -246,24 +246,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             try:
                 payload = json.loads(body)
                 if "model" in payload and payload["model"] in settings.model_mapping:
+                    old_model = payload["model"]
                     payload["model"] = settings.model_mapping[payload["model"]]
+                    print(f"[LB] Rewriting model {old_model} -> {payload['model']}", flush=True)
                     body = json.dumps(payload).encode("utf-8")
                     # Update content-length if it exists
                     if "content-length" in request.headers:
                         incoming_headers = dict(_forward_headers(request))
                         incoming_headers["content-length"] = str(len(body))
                         _request_headers_cache = incoming_headers
-            except Exception:
+            except Exception as e:
+                print(f"[LB] Error parsing JSON/mapping model: {e}", flush=True)
                 pass
                 
         incoming_headers = locals().get("_request_headers_cache", _forward_headers(request))
         last_response: httpx.Response | None = None
         last_error: Exception | None = None
 
-        for account in pool.next_attempts(settings.max_attempts):
+        attempted_accounts = pool.next_attempts(settings.max_attempts)
+        for i, account in enumerate(attempted_accounts):
             headers = dict(incoming_headers)
             headers["authorization"] = f"Bearer {account.api_token}"
             headers["cf-aig-authorization"] = f"Bearer {account.api_token}"
+            
+            print(f"[LB] Attempt {i+1}: Trying account {account.name}...", flush=True)
 
             try:
                 upstream_response = await client.send(
@@ -277,8 +283,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     stream=True,
                 )
             except httpx.HTTPError as exc:
+                print(f"[LB] Attempt {i+1}: Account {account.name} failed with network error: {exc}", flush=True)
                 last_error = exc
                 continue
+
+            print(f"[LB] Attempt {i+1}: Account {account.name} returned status {upstream_response.status_code}", flush=True)
 
             if upstream_response.status_code not in RETRY_STATUSES:
                 return await _tracked_response(upstream_response, account, usage_tracker)
@@ -287,8 +296,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await upstream_response.aclose()
 
         if last_response is not None:
+            tried_names = ", ".join(a.name for a in attempted_accounts)
             return JSONResponse(
-                {"error": "All Cloudflare accounts failed or were rate limited.", "last_status": last_response.status_code},
+                {"error": f"All Cloudflare accounts failed or were rate limited. Tried: {tried_names}", "last_status": last_response.status_code},
                 status_code=last_response.status_code,
             )
 
