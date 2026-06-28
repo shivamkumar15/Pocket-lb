@@ -464,80 +464,250 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool
 
         <div id="tab-dashboard" class="tab-panel" style="display: block;">
           <section class="stats">
-            <div><b id="stat-accounts">{len(settings.accounts)}</b><span>Accounts</span></div>
-            <div><b id="stat-requests">{_format_int(total_requests)}</b><span>Requests proxied</span></div>
-            <div><b id="stat-tokens">{_format_int(total_observed)}</b><span>Total tokens</span></div>
-            <div><b id="stat-remaining">{_format_optional_int(total_remaining)}</b><span>Estimated remaining</span></div>
-          </section>
-
-          <section class="dashboard-section quota-panel">
-              <div class="section-title">
-                <h3>Total quota</h3>
-                <span id="quota-configured">{configured_quota_count}/{len(settings.accounts)} configured</span>
+            <div class="stat-card pink-glow">
+              <div class="stat-icon pink-icon">
+                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
               </div>
-              <div class="quota-total">
-                <strong id="quota-observed">{_format_int(total_observed)}</strong>
-                <span>observed tokens</span>
+              <div class="stat-info">
+                <b id="stat-accounts">{len(settings.accounts)}</b>
+                <span>Accounts</span>
               </div>
-              <div class="meter large"><i id="quota-meter" style="width: {total_usage_percent}%"></i></div>
-              <div class="endpoint-meta">
-                <span>Remaining <b id="quota-remaining">{_format_optional_int(total_remaining)}</b></span>
-                <span>Unknown <b id="quota-unknown">{_format_int(total_unknown)}</b></span>
+              <div class="stat-sparkline">
+                <svg viewBox="0 0 100 30" width="80" height="24"><path d="M0,25 Q15,5 30,20 T60,10 T90,25" fill="none" stroke="#ff00a0" stroke-width="2" filter="drop-shadow(0 0 2px #ff00a0)"/></svg>
               </div>
-          </section>
-
-          <section class="chart-grid">
-            <div class="chart-panel quota-chart-panel">
-              <div class="section-title">
-                <h3>Quota shape</h3>
-                <span>Observed vs remaining</span>
+            </div>
+            <div class="stat-card cyan-glow">
+              <div class="stat-icon cyan-icon">
+                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline><polyline points="17 6 23 6 23 12"></polyline></svg>
               </div>
-              <div class="donut-wrap">
-                <svg class="donut" viewBox="0 0 120 120" role="img" aria-label="Quota usage chart">
-                  <circle class="donut-track" cx="60" cy="60" r="44"></circle>
-                  <circle class="donut-value" id="quota-donut" cx="60" cy="60" r="44" style="stroke-dasharray: {total_usage_percent} 100"></circle>
-                </svg>
-                <div class="donut-center">
-                  <b id="quota-percent">{total_usage_percent}%</b>
-                  <span>used</span>
+              <div class="stat-info">
+                <b id="stat-requests">{_format_int(total_requests)}</b>
+                <span>Requests proxied</span>
+              </div>
+              <div class="stat-sparkline">
+                <svg viewBox="0 0 100 30" width="80" height="24"><path d="M0,20 Q15,28 30,10 T60,18 T90,5" fill="none" stroke="#00f0ff" stroke-width="2" filter="drop-shadow(0 0 2px #00f0ff)"/></svg>
+              </div>
+            </div>
+            <div class="stat-card pink-glow">
+              <div class="stat-icon pink-icon">
+                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg>
+              </div>
+              <div class="stat-info">
+                <b id="stat-tokens">{_format_int(total_observed)}</b>
+                <span>Total tokens</span>
+              </div>
+              <div class="stat-sparkline">
+                <svg viewBox="0 0 100 30" width="80" height="24"><path d="M0,15 Q15,5 30,25 T60,8 T90,12" fill="none" stroke="#ff00a0" stroke-width="2" filter="drop-shadow(0 0 2px #ff00a0)"/></svg>
+              </div>
+            </div>
+            <div class="stat-card cyan-glow">
+              <div class="stat-icon cyan-icon">
+                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line></svg>
+              </div>
+              <div class="stat-info">
+                <b id="stat-remaining">{_format_optional_int(total_remaining)}</b>
+                <span>Estimated remaining</span>
+              </div>
+              <div class="stat-sparkline" style="display: flex; align-items: center; width: 80px;">
+                <div style="width: 100%; height: 4px; background: rgba(0, 240, 255, 0.1); border-radius: 2px; overflow: hidden;">
+                  <div style="width: 75%; height: 100%; background: #00f0ff; box-shadow: 0 0 8px #00f0ff;"></div>
                 </div>
               </div>
-              <div class="chart-legend">
-                <span><i class="legend-used"></i>Observed</span>
-                <span><i class="legend-left"></i>Remaining / unset</span>
-              </div>
-            </div>
-
-            <div class="chart-panel">
-              <div class="section-title">
-                <h3>Account distribution</h3>
-                <span>Token split</span>
-              </div>
-              <div class="bar-chart" id="account-bars">{_account_bars(snapshots)}</div>
             </div>
           </section>
 
-          <section class="mini-chart-grid">
-            <div class="mini-chart-panel">
-              <div class="section-title">
+          <section class="dashboard-section quota-panel" style="padding: 0; background: transparent; box-shadow: none;">
+            <!-- Grid wrapper mimicking the screenshot -->
+            <div style="display: grid; grid-template-columns: 1fr 1.5fr 1fr; gap: 16px;">
+              <!-- 1. Quota shape (Left) -->
+              <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
+                <div class="section-title" style="margin-bottom: 8px;">
+                  <h3>Quota shape</h3>
+                  <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
+                </div>
+                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; min-height: 180px; position: relative;">
+                  <!-- Nested concentric SVGs -->
+                  <svg viewBox="0 0 100 100" width="140" height="140">
+                    <circle cx="50" cy="50" r="40" stroke="rgba(255, 255, 255, 0.05)" stroke-width="4" fill="none" />
+                    <circle cx="50" cy="50" r="40" stroke="#00f0ff" stroke-width="4" fill="none" stroke-dasharray="251" stroke-dashoffset="180" stroke-linecap="round" filter="drop-shadow(0 0 4px #00f0ff)" />
+                    
+                    <circle cx="50" cy="50" r="30" stroke="rgba(255, 255, 255, 0.05)" stroke-width="4" fill="none" />
+                    <circle cx="50" cy="50" r="30" stroke="#ff00a0" stroke-width="4" fill="none" stroke-dasharray="188" stroke-dashoffset="100" stroke-linecap="round" filter="drop-shadow(0 0 4px #ff00a0)" />
+                    
+                    <circle cx="50" cy="50" r="20" stroke="rgba(255, 255, 255, 0.05)" stroke-width="4" fill="none" />
+                    <circle cx="50" cy="50" r="20" stroke="#00f0ff" stroke-width="4" fill="none" stroke-dasharray="125" stroke-dashoffset="40" stroke-linecap="round" filter="drop-shadow(0 0 4px #00f0ff)" />
+                  </svg>
+                  <div style="position: absolute; text-align: center; top: 50%; transform: translateY(-50%);">
+                    <div style="font-size: 22px; font-weight: 700; color: var(--text); font-family: var(--mono);">{total_usage_percent}%</div>
+                    <div style="font-size: 10px; color: var(--muted);">used</div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 2. Total Quota (Middle Gauge + Progress bar) -->
+              <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
+                <div class="section-title" style="margin-bottom: 8px;">
+                  <h3>Total Quota</h3>
+                  <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
+                </div>
+                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1;">
+                  <!-- Semi-circle Gauge -->
+                  <div style="position: relative; width: 180px; height: 100px; display: flex; justify-content: center; align-items: flex-end; overflow: hidden; margin-bottom: 12px;">
+                    <svg viewBox="0 0 100 50" width="180" height="90" style="position: absolute; bottom: 0;">
+                      <!-- Background Arc -->
+                      <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="rgba(255, 255, 255, 0.05)" stroke-width="8" stroke-linecap="round" />
+                      <!-- Active Arc -->
+                      <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="url(#gauge-grad)" stroke-width="8" stroke-linecap="round"
+                            stroke-dasharray="126" stroke-dashoffset="{126 - (126 * total_usage_percent / 100)}" filter="drop-shadow(0 0 6px rgba(0, 240, 255, 0.5))" />
+                      <defs>
+                        <linearGradient id="gauge-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+                          <stop offset="0%" stop-color="#00f0ff" />
+                          <stop offset="100%" stop-color="#ff00a0" />
+                        </linearGradient>
+                      </defs>
+                    </svg>
+                    <div style="text-align: center; margin-bottom: 10px; z-index: 2;">
+                      <div style="font-size: 26px; font-weight: bold; color: var(--text); font-family: var(--mono);">{total_usage_percent}%</div>
+                      <div style="font-size: 11px; color: var(--muted);">{_format_int(total_observed)} observed tokens</div>
+                    </div>
+                  </div>
+
+                  <!-- Glowing Neon Horizontal Progress Bar -->
+                  <div style="width: 100%; height: 12px; background: rgba(255,255,255,0.03); border-radius: 99px; position: relative; overflow: hidden; margin-bottom: 16px;">
+                    <div id="quota-meter" style="width: {total_usage_percent}%; height: 100%; background: linear-gradient(90deg, #00f0ff, #ff00a0); box-shadow: 0 0 12px rgba(0,240,255,0.6); border-radius: 99px; transition: width 0.3s ease;"></div>
+                  </div>
+
+                  <!-- Badges in outline boxes -->
+                  <div style="display: flex; gap: 12px; width: 100%; justify-content: space-between;">
+                    <div style="flex: 1; border: 1px solid rgba(0, 240, 255, 0.3); background: rgba(0, 240, 255, 0.02); border-radius: 8px; padding: 6px 12px; font-size: 11px; text-align: center; color: #00f0ff; text-shadow: 0 0 4px rgba(0, 240, 255, 0.2);">
+                      Remaining: <b id="quota-remaining" style="font-family: var(--mono);">{_format_optional_int(total_remaining)}</b>
+                    </div>
+                    <div style="flex: 1; border: 1px solid rgba(255, 0, 160, 0.3); background: rgba(255, 0, 160, 0.02); border-radius: 8px; padding: 6px 12px; font-size: 11px; text-align: center; color: #ff00a0; text-shadow: 0 0 4px rgba(255, 0, 160, 0.2);">
+                      Unknown: <b id="quota-unknown" style="font-family: var(--mono);">{_format_int(total_unknown)}</b>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 3. Account Distribution (Right) -->
+              <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
+                <div class="section-title" style="margin-bottom: 8px;">
+                  <h3>Account distribution</h3>
+                  <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
+                </div>
+                <div class="bar-chart" id="account-bars" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 10px;">
+                  {_account_bars(snapshots)}
+                </div>
+              </div>
+            </div>
+          </section>
+
+
+
+                    <section class="mini-chart-grid">
+            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
+              <div class="section-title" style="margin-bottom: 12px;">
                 <h3>Request mix</h3>
-                <span>Known vs unknown</span>
+                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
               </div>
-              <div class="spark-bars" id="request-mix-bars">{_request_mix_bars(total_requests, total_unknown)}</div>
+              <div style="flex: 1; display: flex; align-items: flex-end; position: relative; overflow: hidden; padding-left: 20px;">
+                <!-- Y-axis labels -->
+                <div style="position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; color: var(--muted);">
+                  <span>100</span><span>80</span><span>60</span><span>40</span><span>20</span>
+                </div>
+                <!-- Line Chart SVG -->
+                <svg viewBox="0 0 200 100" width="100%" height="100%" style="overflow: visible;" preserveAspectRatio="none">
+                  <!-- Grid -->
+                  <path d="M0 0 H200 M0 25 H200 M0 50 H200 M0 75 H200 M0 100 H200" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
+                  <path d="M0 0 V100 M40 0 V100 M80 0 V100 M120 0 V100 M160 0 V100 M200 0 V100" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
+                  
+                  <!-- Magenta Line -->
+                  <path d="M0 50 L30 50 L60 80 L90 70 L120 90 L150 40 L180 70 L200 60" stroke="#ff00a0" stroke-width="2" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" />
+                  <!-- Cyan Line -->
+                  <path d="M0 90 L30 70 L60 90 L90 80 L120 85 L150 95 L180 75 L200 90" stroke="#00f0ff" stroke-width="2" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" />
+                </svg>
+              </div>
             </div>
-            <div class="mini-chart-panel">
-              <div class="section-title">
+
+            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
+              <div class="section-title" style="margin-bottom: 12px;">
                 <h3>Token composition</h3>
-                <span>Prompt / completion</span>
+                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
               </div>
-              <div class="composition-chart" id="composition-chart">{_composition_chart(snapshots)}</div>
+              <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
+                <svg viewBox="0 0 100 100" width="130" height="130">
+                  <circle cx="50" cy="50" r="40" stroke="rgba(255, 255, 255, 0.05)" stroke-width="16" fill="none" />
+                  <!-- Cyan section -->
+                  <circle cx="50" cy="50" r="40" stroke="#00f0ff" stroke-width="16" fill="none" stroke-dasharray="140 251" stroke-dashoffset="0" filter="drop-shadow(0 0 4px #00f0ff)" />
+                  <!-- Magenta section -->
+                  <circle cx="50" cy="50" r="40" stroke="#ff00a0" stroke-width="16" fill="none" stroke-dasharray="90 251" stroke-dashoffset="-145" filter="drop-shadow(0 0 4px #ff00a0)" />
+                </svg>
+              </div>
             </div>
-            <div class="mini-chart-panel">
-              <div class="section-title">
+
+            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
+              <div class="section-title" style="margin-bottom: 12px;">
                 <h3>Quota radar</h3>
-                <span>Per account usage</span>
+                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
               </div>
-              <div class="radar-rings" id="quota-rings">{_quota_rings(snapshots)}</div>
+              <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
+                <svg viewBox="0 0 100 100" width="130" height="130">
+                  <!-- Radar web -->
+                  <polygon points="50,10 90,35 75,85 25,85 10,35" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
+                  <polygon points="50,25 75,43 65,70 35,70 25,43" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
+                  <polygon points="50,40 60,51 55,60 45,60 40,51" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
+                  <!-- Lines to corners -->
+                  <line x1="50" y1="50" x2="50" y2="10" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
+                  <line x1="50" y1="50" x2="90" y2="35" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
+                  <line x1="50" y1="50" x2="75" y2="85" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
+                  <line x1="50" y1="50" x2="25" y2="85" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
+                  <line x1="50" y1="50" x2="10" y2="35" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
+                  
+                  <!-- Magenta Shape -->
+                  <polygon points="50,25 80,45 65,75 35,75 15,40" stroke="#ff00a0" stroke-width="2" fill="none" filter="drop-shadow(0 0 3px #ff00a0)" />
+                  <circle cx="50" cy="25" r="3" fill="#ff00a0" />
+                  <circle cx="80" cy="45" r="3" fill="#ff00a0" />
+                  <circle cx="65" cy="75" r="3" fill="#ff00a0" />
+                  <circle cx="35" cy="75" r="3" fill="#ff00a0" />
+                  <circle cx="15" cy="40" r="3" fill="#ff00a0" />
+
+                  <!-- Cyan Shape -->
+                  <polygon points="50,40 70,55 55,80 40,70 30,50" stroke="#00f0ff" stroke-width="2" fill="none" filter="drop-shadow(0 0 3px #00f0ff)" />
+                  <circle cx="50" cy="40" r="3" fill="#00f0ff" />
+                  <circle cx="70" cy="55" r="3" fill="#00f0ff" />
+                  <circle cx="55" cy="80" r="3" fill="#00f0ff" />
+                  <circle cx="40" cy="70" r="3" fill="#00f0ff" />
+                  <circle cx="30" cy="50" r="3" fill="#00f0ff" />
+                </svg>
+              </div>
+            </div>
+
+            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
+              <div class="section-title" style="margin-bottom: 12px;">
+                <h3>Per account usage</h3>
+                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
+              </div>
+              <div style="flex: 1; display: flex; align-items: flex-end; position: relative; overflow: hidden; padding-left: 20px;">
+                <!-- Y-axis labels -->
+                <div style="position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; color: var(--muted);">
+                  <span>100</span><span>80</span><span>60</span><span>40</span><span>20</span>
+                </div>
+                <!-- Histogram SVG -->
+                <svg viewBox="0 0 200 100" width="100%" height="100%" style="overflow: visible;" preserveAspectRatio="none">
+                  <!-- Outline bars -->
+                  <rect x="10" y="20" width="8" height="80" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
+                  <rect x="25" y="75" width="8" height="25" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
+                  <rect x="40" y="60" width="8" height="40" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
+                  <rect x="55" y="80" width="8" height="20" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
+                  <rect x="70" y="85" width="8" height="15" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
+                  <rect x="85" y="55" width="8" height="45" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
+                  <rect x="100" y="65" width="8" height="35" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
+                  <rect x="115" y="90" width="8" height="10" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
+                  <rect x="130" y="70" width="8" height="30" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
+                  <rect x="145" y="85" width="8" height="15" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
+                  <rect x="160" y="75" width="8" height="25" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
+                </svg>
+              </div>
             </div>
           </section>
         </div>
@@ -635,6 +805,7 @@ def _dashboard_script() -> str:
         '"': '&quot;',
       }[char]));
       const percent = (account) => {
+        if (!account.token_limit) return 0;
         if (!account.token_limit) return 0;
         return Math.min(100, Math.floor((Number(account.total_tokens || 0) / account.token_limit) * 100));
       };
@@ -850,22 +1021,26 @@ def _dashboard_script() -> str:
 
 def _account_bars(snapshots: list[tuple[CloudflareAccount, dict[str, object]]]) -> str:
     if not snapshots:
-        return '<div class="chart-empty">Add accounts to see token distribution.</div>'
+        return '<div class="chart-empty" style="color: var(--muted); font-size: 12px; text-align: center; padding: 20px;">No accounts active</div>'
     max_tokens = max((int(item["total_tokens"]) for _, item in snapshots), default=0) or 1
-    return "".join(
-        f"""
-        <div class="bar-row">
-          <div class="bar-label">
+    colors = ["#ff00a0", "#00f0ff", "#ff00a0", "#00f0ff"]
+    bars_html = []
+    for index, (account, item) in enumerate(snapshots):
+        pct = max(2, int((int(item['total_tokens']) / max_tokens) * 100))
+        color = colors[index % len(colors)]
+        glow = f"box-shadow: 0 0 8px {color};"
+        bars_html.append(f'''
+        <div style="margin-bottom: 8px;">
+          <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; color: var(--text);">
             <b>{escape(account.name)}</b>
-            <span>{_format_int(int(item['total_tokens']))} tokens</span>
+            <span style="color: var(--muted); font-family: var(--mono);">{_format_int(int(item['total_tokens']))} tokens</span>
           </div>
-          <div class="bar-track">
-            <i class="bar-fill fill-{index % 4}" style="width: {max(2, int((int(item['total_tokens']) / max_tokens) * 100))}%"></i>
+          <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.03); border-radius: 4px; overflow: hidden; position: relative;">
+            <div style="width: {pct}%; height: 100%; background: {color}; {glow} border-radius: 4px;"></div>
           </div>
         </div>
-        """
-        for index, (account, item) in enumerate(snapshots)
-    )
+        ''')
+    return "".join(bars_html)
 
 
 def _request_mix_bars(total_requests: int, total_unknown: int) -> str:
@@ -940,44 +1115,122 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>__TITLE__</title>
   <style>
-    :root {
-      color-scheme: light;
-      --bg: #ffffff;
-      --bg-rail: #fff5f8;
-      --panel: #ffffff;
-      --panel-raised: #fff0f5;
-      --line: #ffd1dc;
-      --line-strong: #ffb6c1;
-      --text: #333333;
-      --muted: #666666;
-      --quiet: #999999;
-      --accent: #ff007f;
-      --accent-ink: #ffffff;
-      --warn: #ff8c00;
-      --danger: #dc143c;
-      --success: #32cd32;
+        :root {
+      color-scheme: dark;
+      --bg: #0a0e17;
+      --bg-rail: #121824;
+      --panel: #121824;
+      --panel-raised: #182030;
+      --line: #1e293b;
+      --line-strong: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --quiet: #64748b;
+      --accent: #00f0ff;
+      --accent-ink: #0a0e17;
+      --warn: #ff00a0;
+      --danger: #ef4444;
+      --success: #10b981;
       --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --bg: #120008;
-      --bg-rail: #1a000a;
-      --panel: #1a000a;
-      --panel-raised: #2a0014;
-      --line: #3d001e;
-      --line-strong: #5c002e;
-      --text: #fff0f5;
-      --muted: #ffb6c1;
-      --quiet: #d87093;
-      --accent: #ff007f;
-      --accent-ink: #ffffff;
-      --warn: #ff8c00;
-      --danger: #ff4500;
-      --success: #32cd32;
+      --bg: #0a0e17;
+      --bg-rail: #121824;
+      --panel: #121824;
+      --panel-raised: #182030;
+      --line: #1e293b;
+      --line-strong: #334155;
+      --text: #f8fafc;
+      --muted: #94a3b8;
+      --quiet: #64748b;
+      --accent: #00f0ff;
+      --accent-ink: #0a0e17;
+      --warn: #ff00a0;
+      --danger: #ef4444;
+      --success: #10b981;
     }
     * { box-sizing: border-box; }
     html, body { min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
+    body {
+      background-image: radial-gradient(rgba(0, 240, 255, 0.015) 1px, transparent 0),
+                        radial-gradient(rgba(255, 0, 160, 0.015) 1px, transparent 0),
+                        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cpath d='M0 20 L20 20 L30 30 L60 30 L70 20 L100 20 M10 50 L10 80 L20 90 L80 90 M90 50 L90 70 L80 80' stroke='rgba(0, 240, 255, 0.02)' stroke-width='1.5' fill='none'/%3E%3Cpath d='M40 0 L40 10 L50 20 L90 20 M30 80 L30 110 L45 110' stroke='rgba(255, 0, 160, 0.015)' stroke-width='1.5' fill='none'/%3E%3Ccircle cx='30' cy='30' r='2' fill='rgba(0, 240, 255, 0.1)'/%3E%3Ccircle cx='80' cy='90' r='2' fill='rgba(255, 0, 160, 0.1)'/%3E%3C/svg%3E");
+      background-size: 120px 120px;
+    }
+    .stats {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 16px;
+    }
+    .stat-card {
+      background: var(--panel);
+      border-radius: 14px;
+      padding: 16px 20px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
+      border: 1px solid rgba(255, 255, 255, 0.03);
+      position: relative;
+      overflow: hidden;
+    }
+    .stat-card::after {
+      content: '';
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      height: 2px;
+      opacity: 0.8;
+    }
+    .stat-card.pink-glow::after {
+      background: #ff00a0;
+      box-shadow: 0 0 8px #ff00a0;
+    }
+    .stat-card.cyan-glow::after {
+      background: #00f0ff;
+      box-shadow: 0 0 8px #00f0ff;
+    }
+    .stat-icon {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .pink-icon {
+      background: rgba(255, 0, 160, 0.1);
+      color: #ff00a0;
+      filter: drop-shadow(0 0 4px rgba(255, 0, 160, 0.2));
+    }
+    .cyan-icon {
+      background: rgba(0, 240, 255, 0.1);
+      color: #00f0ff;
+      filter: drop-shadow(0 0 4px rgba(0, 240, 255, 0.2));
+    }
+    .stat-info {
+      flex: 1;
+      margin-left: 14px;
+      display: flex;
+      flex-direction: column;
+    }
+    .stat-info b {
+      font-size: 20px;
+      line-height: 1.2;
+      color: var(--text);
+      font-family: var(--mono);
+    }
+    .stat-info span {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .stat-sparkline {
+      opacity: 0.85;
+    }
+
     body { font-family: var(--sans); font-size: 14px; line-height: 1.45; }
     body::before, body::after { content: none !important; display: none !important; }
     a { color: inherit; }
@@ -990,7 +1243,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
       border: 0;
       border-radius: 16px;
       padding: 24px;
-      box-shadow: 0 4px 24px rgba(255, 0, 127, 0.04);
+      box-shadow: 0 4px 20px rgba(0, 240, 255, 0.03), 0 4px 20px rgba(255, 0, 160, 0.03);
       transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
     .account-card:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(255, 0, 127, 0.08); }
@@ -1114,7 +1367,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .stats b { display: block; margin-bottom: 4px; font-size: 26px; line-height: 1; }
     .stats span { color: var(--muted); font-size: 12px; }
     .chart-grid { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr); gap: 12px; }
-    .mini-chart-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .mini-chart-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
     .donut-wrap { position: relative; display: grid; place-items: center; min-height: 198px; }
     .donut { width: min(178px, 100%); transform: rotate(-90deg); overflow: visible; }
     .donut-track { stroke: var(--bg); stroke-width: 14; fill: none; }
@@ -1133,10 +1386,10 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .bar-label b { color: var(--text); font-weight: 600; }
     .bar-track { height: 9px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 0; }
     .bar-fill { display: block; height: 100%; border-radius: inherit; }
-    .fill-0, .fill-1, .fill-2, .fill-3 { background: var(--accent); }
-    .fill-1 { background: var(--warn); }
-    .fill-2 { background: oklch(0.72 0.12 260); }
-    .fill-3 { background: var(--danger); }
+    .fill-0 { background: #ff00a0; }
+    .fill-1 { background: #00f0ff; }
+    .fill-2 { background: #ff00a0; }
+    .fill-3 { background: #00f0ff; }
     .spark-bars { display: flex; align-items: flex-end; justify-content: center; gap: 28px; min-height: 128px; }
     .spark-row { display: grid; grid-template-rows: auto 1fr auto; align-items: end; justify-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
     .spark-row i { width: 28px; height: 88px; display: flex; align-items: flex-end; padding: 2px; background: var(--bg); border: 0; border-radius: 8px; }
@@ -1152,10 +1405,10 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .ring-chip svg { width: 42px; height: 42px; flex: 0 0 auto; transform: rotate(-90deg); }
     .ring-track { stroke: var(--bg); stroke-width: 6; fill: none; }
     .ring-value { stroke-width: 6; fill: none; stroke-linecap: round; }
-    .fill-stroke-0 { stroke: var(--accent); }
-    .fill-stroke-1 { stroke: var(--warn); }
-    .fill-stroke-2 { stroke: oklch(0.72 0.12 260); }
-    .fill-stroke-3 { stroke: var(--danger); }
+    .fill-stroke-0 { stroke: #ff00a0; }
+    .fill-stroke-1 { stroke: #00f0ff; }
+    .fill-stroke-2 { stroke: #ff00a0; }
+    .fill-stroke-3 { stroke: #00f0ff; }
     .ring-chip span { min-width: 0; color: var(--quiet); font-size: 12px; }
     .ring-chip b { display: block; color: var(--text); font-family: var(--mono); font-size: 13px; }
     .endpoint-panel label { display: block; color: var(--muted); font-size: 12px; }
