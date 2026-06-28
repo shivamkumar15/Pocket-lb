@@ -22,7 +22,7 @@ https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/*
 
 - **Multi-account load balancing** — round-robin requests across unlimited Cloudflare accounts.
 - **Automatic failover** — retries the next account on `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`.
-- **Model mappings** — map standard model names (e.g. `gpt-4o`, `claude-3-5-sonnet`) to any Cloudflare Workers AI model. Configure in the Settings tab.
+- **Model mappings** — map standard model names (e.g. `glm5.2 and other models` to any Cloudflare Workers AI model. Configure in the Settings tab.
 - **Streaming support** — preserves Server-Sent Events (SSE) streaming and parses token usage from stream chunks.
 - **Token usage tracking** — records prompt, completion, and total tokens per account from both regular and streaming responses.
 - **Web dashboard** — live view of accounts, quota usage, per-account token distribution, model mappings, and endpoint info.
