@@ -145,6 +145,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Pocket-LB", version="0.1.0", lifespan=lifespan)
 
+    @app.get("/logo.png")
+    async def get_logo():
+        from fastapi.responses import FileResponse
+        import os
+        path = "hud-dashboard/public/logo.png"
+        if os.path.exists(path):
+            return FileResponse(path)
+        from fastapi import Response
+        return Response(status_code=404)
+
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(saved: bool = False, error: str | None = None) -> str:
         return _dashboard_html(settings, usage_tracker, saved=saved, error=error)
@@ -438,7 +448,7 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool
     """
 
     return _codex_shell(
-        title="GLM LLB",
+        title="pocketLB",
         subtitle="API Load Balancer",
         shell_class="dashboard-shell",
         body=f"""
@@ -932,39 +942,39 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
   <style>
     :root {
       color-scheme: light;
-      --bg: oklch(0.965 0.006 255);
-      --bg-rail: oklch(0.94 0.008 255);
-      --panel: oklch(0.99 0.002 255);
-      --panel-raised: oklch(1 0 0);
-      --line: oklch(0.86 0.012 255);
-      --line-strong: oklch(0.74 0.025 255);
-      --text: oklch(0.22 0.018 255);
-      --muted: oklch(0.43 0.024 255);
-      --quiet: oklch(0.54 0.02 255);
-      --accent: oklch(0.55 0.14 245);
-      --accent-ink: oklch(0.99 0.002 255);
-      --warn: oklch(0.58 0.13 76);
-      --danger: oklch(0.56 0.18 24);
-      --success: oklch(0.48 0.14 152);
+      --bg: #ffffff;
+      --bg-rail: #fff5f8;
+      --panel: #ffffff;
+      --panel-raised: #fff0f5;
+      --line: #ffd1dc;
+      --line-strong: #ffb6c1;
+      --text: #333333;
+      --muted: #666666;
+      --quiet: #999999;
+      --accent: #ff007f;
+      --accent-ink: #ffffff;
+      --warn: #ff8c00;
+      --danger: #dc143c;
+      --success: #32cd32;
       --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
       --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --bg: oklch(0.08 0.008 255);
-      --bg-rail: oklch(0.105 0.01 255);
-      --panel: oklch(0.13 0.012 255);
-      --panel-raised: oklch(0.165 0.014 255);
-      --line: oklch(0.22 0.015 255);
-      --line-strong: oklch(0.3 0.018 255);
-      --text: oklch(0.955 0.006 255);
-      --muted: oklch(0.72 0.018 255);
-      --quiet: oklch(0.58 0.02 255);
-      --accent: oklch(0.76 0.13 188);
-      --accent-ink: oklch(0.16 0.018 210);
-      --warn: oklch(0.78 0.14 76);
-      --danger: oklch(0.72 0.18 24);
-      --success: oklch(0.76 0.14 152);
+      --bg: #120008;
+      --bg-rail: #1a000a;
+      --panel: #1a000a;
+      --panel-raised: #2a0014;
+      --line: #3d001e;
+      --line-strong: #5c002e;
+      --text: #fff0f5;
+      --muted: #ffb6c1;
+      --quiet: #d87093;
+      --accent: #ff007f;
+      --accent-ink: #ffffff;
+      --warn: #ff8c00;
+      --danger: #ff4500;
+      --success: #32cd32;
     }
     * { box-sizing: border-box; }
     html, body { min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
@@ -972,18 +982,21 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     body::before, body::after { content: none !important; display: none !important; }
     a { color: inherit; }
     code { font-family: var(--mono); }
-    main { min-height: 100vh; padding: 20px; background: var(--bg); }
+    main { min-height: 100vh; padding: 32px 20px; background: var(--bg); }
     .wrap { width: min(1120px, 100%); margin: 0 auto; }
     .wrap.dashboard-shell { width: min(1120px, 100%); }
     .card, .dashboard-section, .chart-panel, .mini-chart-panel, .endpoint-panel, .quota-panel, .account-card {
       background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 20px;
+      border: 0;
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 4px 24px rgba(255, 0, 127, 0.04);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
+    .account-card:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(255, 0, 127, 0.08); }
     .dashboard-shell > .card { padding: 0; background: transparent; border: 0; border-radius: 0; }
     .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
-    .logo { width: 36px; height: 36px; display: grid; place-items: center; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+    .logo { width: 36px; height: 36px; display: grid; place-items: center; background: var(--panel); border: 0; border-radius: 10px; }
     .terminal { width: 14px; height: 10px; border: 1px solid var(--accent); border-radius: 3px; }
     h1, h2, h3, p { margin-top: 0; }
     h1 { margin-bottom: 2px; font-size: 20px; letter-spacing: -0.02em; }
@@ -996,7 +1009,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
       align-items: center;
       justify-content: space-between;
       gap: 20px;
-      padding: 12px 20px;
+      padding: 16px 24px;
       background: var(--bg);
       border-bottom: 1px solid var(--line);
       position: sticky;
@@ -1019,7 +1032,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
       background: var(--bg-rail);
       padding: 4px;
       border-radius: 999px;
-      border: 1px solid var(--line);
+      border: 0;
     }
     .tab-btn {
       background: transparent;
@@ -1060,7 +1073,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
       align-items: center;
       gap: 7px;
       white-space: nowrap;
-      border: 1px solid color-mix(in oklch, var(--success), var(--line) 40%);
+      border: 1px solid var(--success);
       border-radius: 999px;
       padding: 5px 10px;
       color: var(--success);
@@ -1088,16 +1101,16 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .account-total strong { font-size: 28px; line-height: 1; }
     .quota-total strong { font-size: 34px; line-height: 1; }
     .account-total span, .quota-total span { color: var(--muted); font-size: 12px; }
-    .quota-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; margin: 14px 0; border: 1px solid var(--line); border-radius: 10px; background: var(--line); }
+    .quota-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1px; overflow: hidden; margin: 14px 0; border: 0; border-radius: 10px; background: var(--line); }
     .quota-grid span { display: flex; flex-direction: column; gap: 3px; min-width: 0; padding: 10px; background: var(--panel); color: var(--quiet); font-size: 11px; }
     .quota-grid b { overflow: hidden; color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; text-overflow: ellipsis; }
     .account-foot { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 14px; color: var(--quiet); font-size: 12px; }
     .account-foot b { color: var(--muted); font-weight: 600; }
-    .meter { height: 8px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+    .meter { height: 8px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 0; }
     .meter i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 180ms ease-out; }
     .meter.large { height: 10px; margin-top: 14px; }
     .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-    .stats div { padding: 16px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+    .stats div { padding: 16px; background: var(--panel); border: 0; border-radius: 12px; }
     .stats b { display: block; margin-bottom: 4px; font-size: 26px; line-height: 1; }
     .stats span { color: var(--muted); font-size: 12px; }
     .chart-grid { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr); gap: 12px; }
@@ -1118,7 +1131,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .bar-row { display: grid; gap: 7px; }
     .bar-label { display: flex; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
     .bar-label b { color: var(--text); font-weight: 600; }
-    .bar-track { height: 9px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+    .bar-track { height: 9px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 0; }
     .bar-fill { display: block; height: 100%; border-radius: inherit; }
     .fill-0, .fill-1, .fill-2, .fill-3 { background: var(--accent); }
     .fill-1 { background: var(--warn); }
@@ -1126,16 +1139,16 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .fill-3 { background: var(--danger); }
     .spark-bars { display: flex; align-items: flex-end; justify-content: center; gap: 28px; min-height: 128px; }
     .spark-row { display: grid; grid-template-rows: auto 1fr auto; align-items: end; justify-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
-    .spark-row i { width: 28px; height: 88px; display: flex; align-items: flex-end; padding: 2px; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; }
+    .spark-row i { width: 28px; height: 88px; display: flex; align-items: flex-end; padding: 2px; background: var(--bg); border: 0; border-radius: 8px; }
     .spark-row b { width: 100%; border-radius: 5px; }
     .spark-row strong { color: var(--text); font-family: var(--mono); font-size: 12px; }
-    .composition-stack { display: flex; height: 12px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 1px solid var(--line); }
+    .composition-stack { display: flex; height: 12px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 0; }
     .composition-stack i { display: block; height: 100%; }
     .composition-meta, .endpoint-meta { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
-    .composition-meta span, .endpoint-meta span { flex: 1 1 130px; min-width: 0; padding: 10px 12px; background: var(--bg-rail); border: 1px solid var(--line); border-radius: 10px; color: var(--quiet); font-size: 12px; }
+    .composition-meta span, .endpoint-meta span { flex: 1 1 130px; min-width: 0; padding: 10px 12px; background: var(--bg-rail); border: 0; border-radius: 10px; color: var(--quiet); font-size: 12px; }
     .composition-meta b, .endpoint-meta b { display: block; overflow: hidden; margin-top: 2px; color: var(--text); font-family: var(--mono); font-size: 12px; font-weight: 600; text-overflow: ellipsis; }
     .radar-rings { display: flex; flex-wrap: wrap; gap: 10px; }
-    .ring-chip { display: flex; align-items: center; gap: 10px; min-width: 132px; padding: 10px; background: var(--bg-rail); border: 1px solid var(--line); border-radius: 10px; }
+    .ring-chip { display: flex; align-items: center; gap: 10px; min-width: 132px; padding: 10px; background: var(--bg-rail); border: 0; border-radius: 10px; }
     .ring-chip svg { width: 42px; height: 42px; flex: 0 0 auto; transform: rotate(-90deg); }
     .ring-track { stroke: var(--bg); stroke-width: 6; fill: none; }
     .ring-value { stroke-width: 6; fill: none; stroke-linecap: round; }
@@ -1146,7 +1159,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .ring-chip span { min-width: 0; color: var(--quiet); font-size: 12px; }
     .ring-chip b { display: block; color: var(--text); font-family: var(--mono); font-size: 13px; }
     .endpoint-panel label { display: block; color: var(--muted); font-size: 12px; }
-    .copyline { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; }
+    .copyline { display: flex; align-items: center; gap: 8px; margin-top: 8px; padding: 6px; background: var(--bg); border: 0; border-radius: 10px; }
     .copyline code { flex: 1; min-width: 0; overflow: auto; padding: 0 8px; color: var(--text); font-size: 13px; white-space: nowrap; }
     .button, .copyline button, button[type="submit"], .theme-toggle { display: inline-flex; align-items: center; justify-content: center; min-height: 36px; border: 1px solid color-mix(in oklch, var(--accent), var(--line) 30%); border-radius: 9px; padding: 8px 13px; background: var(--accent); color: var(--accent-ink); font: 650 13px/1 var(--sans); text-decoration: none; cursor: pointer; transition: background-color 160ms ease-out, border-color 160ms ease-out, transform 160ms ease-out; }
     .button:hover, .copyline button:hover, button[type="submit"]:hover, .theme-toggle:hover { background: color-mix(in oklch, var(--accent), white 14%); }
@@ -1162,13 +1175,13 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .empty-state p { margin-bottom: 16px; }
     .stack { display: grid; gap: 14px; }
     #account-list { display: grid; gap: 12px; }
-    details { background: var(--bg-rail); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+    details { background: var(--bg-rail); border: 0; border-radius: 12px; padding: 14px; }
     summary { cursor: pointer; font-weight: 650; }
     .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 14px; }
     label { color: var(--muted); font-size: 12px; }
-    input { width: 100%; margin-top: 6px; border: 1px solid var(--line); border-radius: 9px; padding: 10px 11px; background: var(--bg); color: var(--text); font: 13px/1.2 var(--sans); }
+    input { width: 100%; margin-top: 6px; border: 0; border-radius: 9px; padding: 10px 11px; background: var(--bg); color: var(--text); font: 13px/1.2 var(--sans); }
     input::placeholder { color: oklch(0.62 0.018 255); }
-    .notice { margin: 14px 0; padding: 12px; border-radius: 10px; border: 1px solid var(--line); }
+    .notice { margin: 14px 0; padding: 12px; border-radius: 10px; border: 0; }
     .notice.success { color: var(--success); background: oklch(0.24 0.035 152 / 0.5); border-color: oklch(0.48 0.08 152); }
     .notice.error { color: var(--danger); background: oklch(0.24 0.035 24 / 0.5); border-color: oklch(0.48 0.1 24); }
     :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
@@ -1195,7 +1208,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
 <body>
   <nav class="top-nav">
     <div class="nav-brand">
-      <div class="logo"><div class="terminal"></div></div>
+      <img src="/logo.png" style="height: 64px; object-fit: contain;" alt="Logo">
       <b>__TITLE__</b>
     </div>
     <div class="tab-pills">

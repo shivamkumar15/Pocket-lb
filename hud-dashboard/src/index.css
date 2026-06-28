@@ -6,7 +6,7 @@
 }
 
 body {
-  background-color: #000;
+  background-color: #ffffff;
   margin: 0;
   padding: 0;
   overflow: hidden; 
@@ -14,7 +14,7 @@ body {
 
 /* Precise dot grid background similar to the Adobe Stock image */
 .dot-grid {
-  background-image: radial-gradient(rgba(255, 255, 255, 0.15) 1px, transparent 1px);
+  background-image: radial-gradient(rgba(0, 0, 0, 0.1) 1px, transparent 1px);
   background-size: 20px 20px;
 }
 
@@ -26,5 +26,5 @@ body {
   background: rgba(0, 0, 0, 1);
 }
 ::-webkit-scrollbar-thumb {
-  background: #00ffff;
+  background: #ff007f;
 }
