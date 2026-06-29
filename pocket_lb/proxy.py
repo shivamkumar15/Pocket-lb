@@ -3,9 +3,11 @@ from __future__ import annotations
 import itertools
 import json
 import time
+from collections import deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from html import escape
+from pathlib import Path
 from urllib.parse import parse_qs
 
 import httpx
@@ -16,7 +18,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from pocket_lb.config import CloudflareAccount, Settings, load_settings
 
 
-RETRY_STATUSES = {408, 409, 410, 425, 429, 500, 502, 503, 504}
+RETRY_STATUSES = {400, 401, 403, 404, 408, 409, 410, 425, 429, 500, 502, 503, 504}
 HOP_BY_HOP_HEADERS = {
     "connection",
     "keep-alive",
@@ -42,20 +44,40 @@ class AccountPool:
 
 
 class UsageTracker:
-    def __init__(self, accounts: list[CloudflareAccount]) -> None:
+    def __init__(self, accounts: list[CloudflareAccount], state_path: Path | None = None) -> None:
+        self.state_path = state_path
+        self._usage: dict[str, dict[str, object]] = {}
         now = time.time()
-        self._usage = {
-            account.account_id: {
-                "requests": 0,
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-                "unknown_token_responses": 0,
-                "period_started_at": now,
-                "last_used_at": None,
-            }
-            for account in accounts
-        }
+        
+        # Load persisted state if exists
+        if self.state_path and self.state_path.exists():
+            try:
+                import json
+                self._usage = json.loads(self.state_path.read_text())
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Failed to load state: {e}")
+
+        # Initialize any missing accounts
+        for account in accounts:
+            if account.account_id not in self._usage:
+                self._usage[account.account_id] = {
+                    "requests": 0,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "total_tokens": 0,
+                    "unknown_token_responses": 0,
+                    "period_started_at": now,
+                    "last_used_at": None,
+                }
+
+    def _save_state(self) -> None:
+        if self.state_path:
+            try:
+                import json
+                self.state_path.write_text(json.dumps(self._usage))
+            except Exception:
+                pass
 
     def record(self, account: CloudflareAccount, payload: object | None) -> None:
         item = self._usage.setdefault(
@@ -77,11 +99,13 @@ class UsageTracker:
         usage = payload.get("usage") if isinstance(payload, dict) else None
         if not isinstance(usage, dict):
             item["unknown_token_responses"] += 1
+            self._save_state()
             return
 
         item["prompt_tokens"] += _safe_int(usage.get("prompt_tokens"))
         item["completion_tokens"] += _safe_int(usage.get("completion_tokens"))
         item["total_tokens"] += _safe_int(usage.get("total_tokens"))
+        self._save_state()
 
     def snapshot(self, account: CloudflareAccount) -> dict[str, object]:
         item = self._usage.setdefault(
@@ -127,10 +151,46 @@ class UsageTracker:
         )
 
 
+class RequestLog:
+    def __init__(self, limit: int = 80, log_path: Path | None = None) -> None:
+        self.log_path = log_path
+        self._entries: deque[dict[str, object]] = deque(maxlen=limit)
+        
+        if self.log_path and self.log_path.exists():
+            try:
+                import json
+                saved = json.loads(self.log_path.read_text())
+                if isinstance(saved, list):
+                    for entry in reversed(saved):  # We snapshot as list (latest first), so insert reversed
+                        self._entries.appendleft(entry)
+            except Exception:
+                pass
+
+    def _save(self) -> None:
+        if self.log_path:
+            try:
+                import json
+                self.log_path.write_text(json.dumps(self.snapshot()))
+            except Exception:
+                pass
+
+    def record(self, entry: dict[str, object]) -> None:
+        self._entries.appendleft({"timestamp": time.time(), **entry})
+        self._save()
+
+    def snapshot(self) -> list[dict[str, object]]:
+        return list(self._entries)
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     pool = AccountPool(settings.accounts)
-    usage_tracker = UsageTracker(settings.accounts)
+    
+    state_path = settings.config_path.with_name("state.json") if settings.config_path else None
+    usage_tracker = UsageTracker(settings.accounts, state_path=state_path)
+    
+    log_path = settings.config_path.with_name("request_log.json") if settings.config_path else None
+    request_log = RequestLog(log_path=log_path)
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     client: httpx.AsyncClient | None = None
 
@@ -157,7 +217,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(saved: bool = False, error: str | None = None) -> str:
-        return _dashboard_html(settings, usage_tracker, saved=saved, error=error)
+        return _dashboard_html(settings, usage_tracker, request_log, saved=saved, error=error)
 
     @app.get("/setup")
     async def setup_form() -> RedirectResponse:
@@ -239,7 +299,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     **item,
                 }
             )
-        return {"accounts": accounts}
+        return {"accounts": accounts, "request_log": request_log.snapshot()}
 
     @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def proxy(path: str, request: Request) -> Response:
@@ -252,12 +312,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
 
         body = await request.body()
+        started_at = time.time()
+        requested_model = None
+        mapped_model = None
         if request.method == "POST" and "application/json" in request.headers.get("content-type", ""):
             try:
                 payload = json.loads(body)
+                requested_model = payload.get("model") if isinstance(payload, dict) else None
                 if "model" in payload and payload["model"] in settings.model_mapping:
                     old_model = payload["model"]
                     payload["model"] = settings.model_mapping[payload["model"]]
+                    mapped_model = payload["model"]
                     print(f"[LB] Rewriting model {old_model} -> {payload['model']}", flush=True)
                     body = json.dumps(payload).encode("utf-8")
                     # Update content-length if it exists
@@ -272,6 +337,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         incoming_headers = locals().get("_request_headers_cache", _forward_headers(request))
         last_response: httpx.Response | None = None
         last_error: Exception | None = None
+        attempts_log = []
 
         attempted_accounts = pool.next_attempts(settings.max_attempts)
         for i, account in enumerate(attempted_accounts):
@@ -294,12 +360,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 )
             except httpx.HTTPError as exc:
                 print(f"[LB] Attempt {i+1}: Account {account.name} failed with network error: {exc}", flush=True)
+                attempts_log.append({"account": account.name, "status": "network-error"})
                 last_error = exc
                 continue
 
             print(f"[LB] Attempt {i+1}: Account {account.name} returned status {upstream_response.status_code}", flush=True)
+            attempts_log.append({"account": account.name, "status": upstream_response.status_code})
 
             if upstream_response.status_code not in RETRY_STATUSES:
+                request_log.record(
+                    {
+                        "method": request.method,
+                        "path": f"/v1/{path}",
+                        "model": requested_model,
+                        "mapped_model": mapped_model,
+                        "status": upstream_response.status_code,
+                        "account": account.name,
+                        "attempts": attempts_log,
+                        "duration_ms": int((time.time() - started_at) * 1000),
+                    }
+                )
                 return await _tracked_response(upstream_response, account, usage_tracker)
 
             last_response = upstream_response
@@ -307,11 +387,36 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         if last_response is not None:
             tried_names = ", ".join(a.name for a in attempted_accounts)
+            request_log.record(
+                {
+                    "method": request.method,
+                    "path": f"/v1/{path}",
+                    "model": requested_model,
+                    "mapped_model": mapped_model,
+                    "status": last_response.status_code,
+                    "account": None,
+                    "attempts": attempts_log,
+                    "duration_ms": int((time.time() - started_at) * 1000),
+                }
+            )
             return JSONResponse(
                 {"error": f"All Cloudflare accounts failed or were rate limited. Tried: {tried_names}", "last_status": last_response.status_code},
                 status_code=last_response.status_code,
             )
 
+        request_log.record(
+            {
+                "method": request.method,
+                "path": f"/v1/{path}",
+                "model": requested_model,
+                "mapped_model": mapped_model,
+                "status": 502,
+                "account": None,
+                "attempts": attempts_log,
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "error": str(last_error) if last_error else None,
+            }
+        )
         return JSONResponse(
             {"error": "All Cloudflare accounts failed.", "detail": str(last_error) if last_error else None},
             status_code=502,
@@ -389,7 +494,7 @@ def _stream_response(response: httpx.Response, account: CloudflareAccount, usage
     )
 
 
-def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool = False, error: str | None = None) -> str:
+def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log: RequestLog, saved: bool = False, error: str | None = None) -> str:
     base_url = f"http://{settings.host}:{settings.port}/v1"
     status_label = "Online" if settings.accounts else "Setup required"
     status_class = "status-ok" if settings.accounts else "status-warn"
@@ -455,7 +560,7 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool
         <header class="dashboard-hero">
           <div>
             <h2>Dashboard</h2>
-            <p class="muted">Overview, account health, and recent request logs.</p>
+            <p class="muted">Real-time metrics and account distribution.</p>
           </div>
           <div class="hero-actions">
             <span class="status {status_class}">{status_label}</span>
@@ -464,250 +569,102 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool
 
         <div id="tab-dashboard" class="tab-panel" style="display: block;">
           <section class="stats">
-            <div class="stat-card pink-glow">
-              <div class="stat-icon pink-icon">
-                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg>
-              </div>
-              <div class="stat-info">
-                <b id="stat-accounts">{len(settings.accounts)}</b>
-                <span>Accounts</span>
-              </div>
-              <div class="stat-sparkline">
-                <svg viewBox="0 0 100 30" width="80" height="24"><path d="M0,25 Q15,5 30,20 T60,10 T90,25" fill="none" stroke="#ff00a0" stroke-width="2" filter="drop-shadow(0 0 2px #ff00a0)"/></svg>
-              </div>
-            </div>
-            <div class="stat-card cyan-glow">
-              <div class="stat-icon cyan-icon">
-                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline><polyline points="17 6 23 6 23 12"></polyline></svg>
-              </div>
-              <div class="stat-info">
-                <b id="stat-requests">{_format_int(total_requests)}</b>
-                <span>Requests proxied</span>
-              </div>
-              <div class="stat-sparkline">
-                <svg viewBox="0 0 100 30" width="80" height="24"><path d="M0,20 Q15,28 30,10 T60,18 T90,5" fill="none" stroke="#00f0ff" stroke-width="2" filter="drop-shadow(0 0 2px #00f0ff)"/></svg>
-              </div>
-            </div>
-            <div class="stat-card pink-glow">
-              <div class="stat-icon pink-icon">
-                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg>
-              </div>
-              <div class="stat-info">
-                <b id="stat-tokens">{_format_int(total_observed)}</b>
-                <span>Total tokens</span>
-              </div>
-              <div class="stat-sparkline">
-                <svg viewBox="0 0 100 30" width="80" height="24"><path d="M0,15 Q15,5 30,25 T60,8 T90,12" fill="none" stroke="#ff00a0" stroke-width="2" filter="drop-shadow(0 0 2px #ff00a0)"/></svg>
-              </div>
-            </div>
-            <div class="stat-card cyan-glow">
-              <div class="stat-icon cyan-icon">
-                <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path><line x1="17.5" y1="6.5" x2="17.51" y2="6.5"></line></svg>
-              </div>
-              <div class="stat-info">
-                <b id="stat-remaining">{_format_optional_int(total_remaining)}</b>
-                <span>Estimated remaining</span>
-              </div>
-              <div class="stat-sparkline" style="display: flex; align-items: center; width: 80px;">
-                <div style="width: 100%; height: 4px; background: rgba(0, 240, 255, 0.1); border-radius: 2px; overflow: hidden;">
-                  <div style="width: 75%; height: 100%; background: #00f0ff; box-shadow: 0 0 8px #00f0ff;"></div>
+            <div class="card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">Active Accounts</span>
+                <div class="stat-icon pink-icon">
+                  <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>
                 </div>
               </div>
+              <div class="stat-value"><b id="stat-accounts">{len(settings.accounts)}</b></div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">Requests Proxied</span>
+                <div class="stat-icon cyan-icon">
+                  <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"></polyline></svg>
+                </div>
+              </div>
+              <div class="stat-value"><b id="stat-requests">{_format_int(total_requests)}</b></div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">Total Tokens Used</span>
+                <div class="stat-icon pink-icon">
+                  <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="16"></line><line x1="8" y1="12" x2="16" y2="12"></line></svg>
+                </div>
+              </div>
+              <div class="stat-value"><b id="stat-tokens">{_format_int(total_observed)}</b></div>
+            </div>
+            <div class="card stat-card">
+              <div class="stat-header">
+                <span class="stat-title">Total Estimated Remaining</span>
+                <div class="stat-icon cyan-icon">
+                  <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none"><rect x="2" y="2" width="20" height="20" rx="5" ry="5"></rect><path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"></path></svg>
+                </div>
+              </div>
+              <div class="stat-value"><b id="stat-remaining">{_format_optional_int(total_remaining)}</b></div>
             </div>
           </section>
 
-          <section class="dashboard-section quota-panel" style="padding: 0; background: transparent; box-shadow: none;">
-            <!-- Grid wrapper mimicking the screenshot -->
-            <div style="display: grid; grid-template-columns: 1fr 1.5fr 1fr; gap: 16px;">
-              <!-- 1. Quota shape (Left) -->
-              <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
-                <div class="section-title" style="margin-bottom: 8px;">
-                  <h3>Quota shape</h3>
-                  <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
+          <section class="dashboard-section" style="margin-top: 24px; padding: 0; background: transparent; border: 0; box-shadow: none;">
+            <div style="display: grid; grid-template-columns: 1fr 2fr; gap: 24px;">
+              
+              <!-- Total System Quota -->
+              <div class="card" style="display: flex; flex-direction: column;">
+                <div class="section-title">
+                  <h3>System Quota Utilization</h3>
                 </div>
-                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; min-height: 180px; position: relative;">
-                  <!-- Nested concentric SVGs -->
-                  <svg viewBox="0 0 100 100" width="140" height="140">
-                    <circle cx="50" cy="50" r="40" stroke="rgba(255, 255, 255, 0.05)" stroke-width="4" fill="none" />
-                    <circle cx="50" cy="50" r="40" stroke="#00f0ff" stroke-width="4" fill="none" stroke-dasharray="251" stroke-dashoffset="180" stroke-linecap="round" filter="drop-shadow(0 0 4px #00f0ff)" />
-                    
-                    <circle cx="50" cy="50" r="30" stroke="rgba(255, 255, 255, 0.05)" stroke-width="4" fill="none" />
-                    <circle cx="50" cy="50" r="30" stroke="#ff00a0" stroke-width="4" fill="none" stroke-dasharray="188" stroke-dashoffset="100" stroke-linecap="round" filter="drop-shadow(0 0 4px #ff00a0)" />
-                    
-                    <circle cx="50" cy="50" r="20" stroke="rgba(255, 255, 255, 0.05)" stroke-width="4" fill="none" />
-                    <circle cx="50" cy="50" r="20" stroke="#00f0ff" stroke-width="4" fill="none" stroke-dasharray="125" stroke-dashoffset="40" stroke-linecap="round" filter="drop-shadow(0 0 4px #00f0ff)" />
-                  </svg>
-                  <div style="position: absolute; text-align: center; top: 50%; transform: translateY(-50%);">
-                    <div style="font-size: 22px; font-weight: 700; color: var(--text); font-family: var(--mono);">{total_usage_percent}%</div>
-                    <div style="font-size: 10px; color: var(--muted);">used</div>
-                  </div>
-                </div>
-              </div>
-
-              <!-- 2. Total Quota (Middle Gauge + Progress bar) -->
-              <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
-                <div class="section-title" style="margin-bottom: 8px;">
-                  <h3>Total Quota</h3>
-                  <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
-                </div>
-                <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1;">
-                  <!-- Semi-circle Gauge -->
-                  <div style="position: relative; width: 180px; height: 100px; display: flex; justify-content: center; align-items: flex-end; overflow: hidden; margin-bottom: 12px;">
-                    <svg viewBox="0 0 100 50" width="180" height="90" style="position: absolute; bottom: 0;">
-                      <!-- Background Arc -->
-                      <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="rgba(255, 255, 255, 0.05)" stroke-width="8" stroke-linecap="round" />
-                      <!-- Active Arc -->
-                      <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="url(#gauge-grad)" stroke-width="8" stroke-linecap="round"
-                            stroke-dasharray="126" stroke-dashoffset="{126 - (126 * total_usage_percent / 100)}" filter="drop-shadow(0 0 6px rgba(0, 240, 255, 0.5))" />
-                      <defs>
-                        <linearGradient id="gauge-grad" x1="0%" y1="0%" x2="100%" y2="0%">
-                          <stop offset="0%" stop-color="#00f0ff" />
-                          <stop offset="100%" stop-color="#ff00a0" />
-                        </linearGradient>
-                      </defs>
+                <div style="flex: 1; display: flex; flex-direction: column; justify-content: center; align-items: center; padding: 24px 0;">
+                  <div style="position: relative; width: 220px; height: 110px; display: flex; justify-content: center; align-items: flex-end; overflow: hidden; margin-bottom: 24px;">
+                    <svg viewBox="0 0 100 50" width="220" height="110" style="position: absolute; bottom: 0;">
+                      <path d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="var(--line)" stroke-width="12" stroke-linecap="round" />
+                      <path id="quota-donut" d="M 10 50 A 40 40 0 0 1 90 50" fill="none" stroke="var(--accent)" stroke-width="12" stroke-linecap="round"
+                            stroke-dasharray="{int(126 * total_usage_percent / 100)} 126" />
                     </svg>
-                    <div style="text-align: center; margin-bottom: 10px; z-index: 2;">
-                      <div style="font-size: 26px; font-weight: bold; color: var(--text); font-family: var(--mono);">{total_usage_percent}%</div>
-                      <div style="font-size: 11px; color: var(--muted);">{_format_int(total_observed)} observed tokens</div>
+                    <div style="text-align: center; margin-bottom: 12px; z-index: 2;">
+                      <div id="quota-percent" style="font-size: 36px; font-weight: 800; color: var(--text); font-family: var(--mono); line-height: 1;">{total_usage_percent}%</div>
+                      <div style="font-size: 13px; color: var(--muted); margin-top: 4px;">Utilized</div>
                     </div>
                   </div>
-
-                  <!-- Glowing Neon Horizontal Progress Bar -->
-                  <div style="width: 100%; height: 12px; background: rgba(255,255,255,0.03); border-radius: 99px; position: relative; overflow: hidden; margin-bottom: 16px;">
-                    <div id="quota-meter" style="width: {total_usage_percent}%; height: 100%; background: linear-gradient(90deg, #00f0ff, #ff00a0); box-shadow: 0 0 12px rgba(0,240,255,0.6); border-radius: 99px; transition: width 0.3s ease;"></div>
-                  </div>
-
-                  <!-- Badges in outline boxes -->
-                  <div style="display: flex; gap: 12px; width: 100%; justify-content: space-between;">
-                    <div style="flex: 1; border: 1px solid rgba(0, 240, 255, 0.3); background: rgba(0, 240, 255, 0.02); border-radius: 8px; padding: 6px 12px; font-size: 11px; text-align: center; color: #00f0ff; text-shadow: 0 0 4px rgba(0, 240, 255, 0.2);">
-                      Remaining: <b id="quota-remaining" style="font-family: var(--mono);">{_format_optional_int(total_remaining)}</b>
+                  
+                  <div style="width: 100%; display: flex; flex-direction: column; gap: 12px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 13px;">
+                      <span style="color: var(--muted);">Total Limit</span>
+                      <b style="color: var(--text); font-family: var(--mono);">{_format_optional_int(total_limit) if total_limit else 'Unlimited'}</b>
                     </div>
-                    <div style="flex: 1; border: 1px solid rgba(255, 0, 160, 0.3); background: rgba(255, 0, 160, 0.02); border-radius: 8px; padding: 6px 12px; font-size: 11px; text-align: center; color: #ff00a0; text-shadow: 0 0 4px rgba(255, 0, 160, 0.2);">
-                      Unknown: <b id="quota-unknown" style="font-family: var(--mono);">{_format_int(total_unknown)}</b>
+                    <div style="display: flex; justify-content: space-between; font-size: 13px;">
+                      <span style="color: var(--muted);">Tokens Used</span>
+                      <b id="quota-observed" style="color: var(--text); font-family: var(--mono);">{_format_int(total_observed)}</b>
+                    </div>
+                    <div style="display: flex; justify-content: space-between; font-size: 13px;">
+                      <span style="color: var(--muted);">Uncounted (Stream/Unknown)</span>
+                      <b id="quota-unknown" style="color: var(--text); font-family: var(--mono);">{_format_int(total_unknown)}</b>
                     </div>
                   </div>
                 </div>
               </div>
 
-              <!-- 3. Account Distribution (Right) -->
-              <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; height: 100%;">
-                <div class="section-title" style="margin-bottom: 8px;">
-                  <h3>Account distribution</h3>
-                  <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
+              <!-- Account Distribution List -->
+              <div class="card" style="display: flex; flex-direction: column;">
+                <div class="section-title">
+                  <h3>Account Distribution</h3>
+                  <span id="quota-configured" style="font-size: 13px;">{configured_quota_count}/{len(snapshots)} configured</span>
                 </div>
-                <div class="bar-chart" id="account-bars" style="flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 10px;">
+                <div class="bar-chart" id="account-bars" style="flex: 1; display: flex; flex-direction: column; gap: 16px; margin-top: 16px; overflow-y: auto; max-height: 280px; padding-right: 8px;">
                   {_account_bars(snapshots)}
                 </div>
               </div>
             </div>
           </section>
 
-
-
-                    <section class="mini-chart-grid">
-            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
-              <div class="section-title" style="margin-bottom: 12px;">
-                <h3>Request mix</h3>
-                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
-              </div>
-              <div style="flex: 1; display: flex; align-items: flex-end; position: relative; overflow: hidden; padding-left: 20px;">
-                <!-- Y-axis labels -->
-                <div style="position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; color: var(--muted);">
-                  <span>100</span><span>80</span><span>60</span><span>40</span><span>20</span>
-                </div>
-                <!-- Line Chart SVG -->
-                <svg viewBox="0 0 200 100" width="100%" height="100%" style="overflow: visible;" preserveAspectRatio="none">
-                  <!-- Grid -->
-                  <path d="M0 0 H200 M0 25 H200 M0 50 H200 M0 75 H200 M0 100 H200" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
-                  <path d="M0 0 V100 M40 0 V100 M80 0 V100 M120 0 V100 M160 0 V100 M200 0 V100" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
-                  
-                  <!-- Magenta Line -->
-                  <path d="M0 50 L30 50 L60 80 L90 70 L120 90 L150 40 L180 70 L200 60" stroke="#ff00a0" stroke-width="2" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" />
-                  <!-- Cyan Line -->
-                  <path d="M0 90 L30 70 L60 90 L90 80 L120 85 L150 95 L180 75 L200 90" stroke="#00f0ff" stroke-width="2" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" />
-                </svg>
-              </div>
+          <section class="dashboard-section request-log-section">
+            <div class="section-title">
+              <h3>Request Log</h3>
+              <span id="request-log-count">{len(request_log.snapshot())} recent</span>
             </div>
-
-            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
-              <div class="section-title" style="margin-bottom: 12px;">
-                <h3>Token composition</h3>
-                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
-              </div>
-              <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
-                <svg viewBox="0 0 100 100" width="130" height="130">
-                  <circle cx="50" cy="50" r="40" stroke="rgba(255, 255, 255, 0.05)" stroke-width="16" fill="none" />
-                  <!-- Cyan section -->
-                  <circle cx="50" cy="50" r="40" stroke="#00f0ff" stroke-width="16" fill="none" stroke-dasharray="140 251" stroke-dashoffset="0" filter="drop-shadow(0 0 4px #00f0ff)" />
-                  <!-- Magenta section -->
-                  <circle cx="50" cy="50" r="40" stroke="#ff00a0" stroke-width="16" fill="none" stroke-dasharray="90 251" stroke-dashoffset="-145" filter="drop-shadow(0 0 4px #ff00a0)" />
-                </svg>
-              </div>
-            </div>
-
-            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
-              <div class="section-title" style="margin-bottom: 12px;">
-                <h3>Quota radar</h3>
-                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
-              </div>
-              <div style="flex: 1; display: flex; align-items: center; justify-content: center;">
-                <svg viewBox="0 0 100 100" width="130" height="130">
-                  <!-- Radar web -->
-                  <polygon points="50,10 90,35 75,85 25,85 10,35" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
-                  <polygon points="50,25 75,43 65,70 35,70 25,43" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
-                  <polygon points="50,40 60,51 55,60 45,60 40,51" stroke="rgba(255,255,255,0.05)" stroke-width="1" fill="none" />
-                  <!-- Lines to corners -->
-                  <line x1="50" y1="50" x2="50" y2="10" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
-                  <line x1="50" y1="50" x2="90" y2="35" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
-                  <line x1="50" y1="50" x2="75" y2="85" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
-                  <line x1="50" y1="50" x2="25" y2="85" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
-                  <line x1="50" y1="50" x2="10" y2="35" stroke="rgba(255,255,255,0.05)" stroke-width="1" />
-                  
-                  <!-- Magenta Shape -->
-                  <polygon points="50,25 80,45 65,75 35,75 15,40" stroke="#ff00a0" stroke-width="2" fill="none" filter="drop-shadow(0 0 3px #ff00a0)" />
-                  <circle cx="50" cy="25" r="3" fill="#ff00a0" />
-                  <circle cx="80" cy="45" r="3" fill="#ff00a0" />
-                  <circle cx="65" cy="75" r="3" fill="#ff00a0" />
-                  <circle cx="35" cy="75" r="3" fill="#ff00a0" />
-                  <circle cx="15" cy="40" r="3" fill="#ff00a0" />
-
-                  <!-- Cyan Shape -->
-                  <polygon points="50,40 70,55 55,80 40,70 30,50" stroke="#00f0ff" stroke-width="2" fill="none" filter="drop-shadow(0 0 3px #00f0ff)" />
-                  <circle cx="50" cy="40" r="3" fill="#00f0ff" />
-                  <circle cx="70" cy="55" r="3" fill="#00f0ff" />
-                  <circle cx="55" cy="80" r="3" fill="#00f0ff" />
-                  <circle cx="40" cy="70" r="3" fill="#00f0ff" />
-                  <circle cx="30" cy="50" r="3" fill="#00f0ff" />
-                </svg>
-              </div>
-            </div>
-
-            <div class="card" style="display: flex; flex-direction: column; justify-content: space-between; min-height: 200px;">
-              <div class="section-title" style="margin-bottom: 12px;">
-                <h3>Per account usage</h3>
-                <span style="font-size: 16px; cursor: pointer; color: var(--muted);">⋮</span>
-              </div>
-              <div style="flex: 1; display: flex; align-items: flex-end; position: relative; overflow: hidden; padding-left: 20px;">
-                <!-- Y-axis labels -->
-                <div style="position: absolute; left: 0; top: 0; bottom: 0; display: flex; flex-direction: column; justify-content: space-between; font-size: 10px; color: var(--muted);">
-                  <span>100</span><span>80</span><span>60</span><span>40</span><span>20</span>
-                </div>
-                <!-- Histogram SVG -->
-                <svg viewBox="0 0 200 100" width="100%" height="100%" style="overflow: visible;" preserveAspectRatio="none">
-                  <!-- Outline bars -->
-                  <rect x="10" y="20" width="8" height="80" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
-                  <rect x="25" y="75" width="8" height="25" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
-                  <rect x="40" y="60" width="8" height="40" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
-                  <rect x="55" y="80" width="8" height="20" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
-                  <rect x="70" y="85" width="8" height="15" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
-                  <rect x="85" y="55" width="8" height="45" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
-                  <rect x="100" y="65" width="8" height="35" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
-                  <rect x="115" y="90" width="8" height="10" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
-                  <rect x="130" y="70" width="8" height="30" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
-                  <rect x="145" y="85" width="8" height="15" stroke="#00f0ff" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #00f0ff)" rx="2" />
-                  <rect x="160" y="75" width="8" height="25" stroke="#ff00a0" stroke-width="1.5" fill="none" filter="drop-shadow(0 0 2px #ff00a0)" rx="2" />
-                </svg>
-              </div>
+            <div class="request-log" id="request-log">
+              {_request_log_rows(request_log.snapshot())}
             </div>
           </section>
         </div>
@@ -782,6 +739,58 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, saved: bool
     )
 
 
+def _request_log_rows(entries: list[dict[str, object]]) -> str:
+    if not entries:
+        return '<div class="chart-empty">No proxied requests yet. Send traffic to <code>/v1</code> to populate this log.</div>'
+
+    rows = []
+    for entry in entries:
+        status = entry.get("status")
+        model = escape(str(entry.get("model") or "Unknown model"))
+        mapped_model = entry.get("mapped_model")
+        if mapped_model:
+            model = f"{model} &rarr; {escape(str(mapped_model))}"
+        attempts = entry.get("attempts")
+        attempt_text = "No attempts recorded"
+        if isinstance(attempts, list):
+            attempt_text = " · ".join(
+                f"{escape(str(attempt.get('account', 'unknown')))}:{escape(str(attempt.get('status', 'unknown')))}"
+                for attempt in attempts
+                if isinstance(attempt, dict)
+            ) or attempt_text
+        rows.append(
+            f"""
+            <div class="request-log-row">
+              <div class="request-log-main">
+                <span class="request-status {_request_status_class(status)}">{escape(str(status or 'n/a'))}</span>
+                <div>
+                  <b>{escape(str(entry.get('method') or 'GET'))} {escape(str(entry.get('path') or '/v1'))}</b>
+                  <span>{model}</span>
+                </div>
+              </div>
+              <div class="request-log-meta">
+                <span>{escape(str(entry.get('account') or 'No account accepted'))}</span>
+                <span>{_format_int(int(entry.get('duration_ms') or 0))}ms</span>
+                <span>{_format_time_ago(entry.get('timestamp'))}</span>
+              </div>
+              <code>{attempt_text}</code>
+            </div>
+            """
+        )
+    return "".join(rows)
+
+
+def _request_status_class(status: object) -> str:
+    code = _safe_int(status)
+    if 200 <= code < 300:
+        return "ok"
+    if code == 429:
+        return "warn"
+    if code >= 400:
+        return "error"
+    return "muted"
+
+
 def _dashboard_script() -> str:
     return """<script>
       const $ = (id) => document.getElementById(id);
@@ -826,6 +835,38 @@ def _dashboard_script() -> str:
         if (hours < 24) return `${hours}h ${minutes % 60}m ago`;
         return `${Math.floor(hours / 24)}d ago`;
       };
+      const statusClass = (status) => {
+        const code = Number(status || 0);
+        if (code >= 200 && code < 300) return 'ok';
+        if (code === 429) return 'warn';
+        if (code >= 400) return 'error';
+        return 'muted';
+      };
+      const renderRequestLog = (entries = []) => {
+        if (!entries.length) {
+          return '<div class="chart-empty">No proxied requests yet. Send traffic to <code>/v1</code> to populate this log.</div>';
+        }
+        return entries.map((entry) => {
+          const model = entry.model ? `${escapeHtml(entry.model)}${entry.mapped_model ? ` → ${escapeHtml(entry.mapped_model)}` : ''}` : 'Unknown model';
+          const attempts = (entry.attempts || []).map((attempt) => `${escapeHtml(attempt.account)}:${escapeHtml(attempt.status)}`).join(' · ');
+          return `
+            <div class="request-log-row">
+              <div class="request-log-main">
+                <span class="request-status ${statusClass(entry.status)}">${escapeHtml(entry.status)}</span>
+                <div>
+                  <b>${escapeHtml(entry.method || 'GET')} ${escapeHtml(entry.path || '/v1')}</b>
+                  <span>${model}</span>
+                </div>
+              </div>
+              <div class="request-log-meta">
+                <span>${escapeHtml(entry.account || 'No account accepted')}</span>
+                <span>${formatInt(entry.duration_ms)}ms</span>
+                <span>${timeAgo(entry.timestamp)}</span>
+              </div>
+              <code>${attempts || 'No attempts recorded'}</code>
+            </div>`;
+        }).join('');
+      };
       const accountCard = (account) => `
         <div class="account-card">
           <div class="account-top">
@@ -853,7 +894,7 @@ def _dashboard_script() -> str:
             <span>Last used: <b>${timeAgo(account.last_used_at)}</b></span>
           </div>
         </div>`;
-      const renderUsage = ({ accounts = [] }) => {
+      const renderUsage = ({ accounts = [], request_log = [] }) => {
         const totalObserved = accounts.reduce((sum, account) => sum + Number(account.total_tokens || 0), 0);
         const totalLimit = accounts.reduce((sum, account) => sum + Number(account.token_limit || 0), 0);
         const totalRemaining = totalLimit ? Math.max(0, totalLimit - totalObserved) : null;
@@ -864,20 +905,22 @@ def _dashboard_script() -> str:
         $('quota-configured').textContent = `${configuredQuota}/${accounts.length} configured`;
         $('quota-observed').textContent = formatInt(totalObserved);
         const quotaPercent = totalLimit ? Math.min(100, Math.floor((totalObserved / totalLimit) * 100)) : 0;
-        $('quota-meter').style.width = `${quotaPercent}%`;
+        if ($('quota-meter')) $('quota-meter').style.width = `${quotaPercent}%`;
         $('quota-donut').style.strokeDasharray = `${quotaPercent} 100`;
         $('quota-percent').textContent = `${quotaPercent}%`;
-        $('quota-remaining').textContent = formatOptionalInt(totalRemaining);
+        if ($('quota-remaining')) $('quota-remaining').textContent = formatOptionalInt(totalRemaining);
         $('quota-unknown').textContent = formatInt(totalUnknown);
         $('stat-accounts').textContent = formatInt(accounts.length);
         $('stat-requests').textContent = formatInt(totalRequests);
         $('stat-tokens').textContent = formatInt(totalObserved);
         $('stat-remaining').textContent = formatOptionalInt(totalRemaining);
         $('account-bars').innerHTML = renderBars(accounts);
-        $('request-mix-bars').innerHTML = renderRequestMix(totalRequests, totalUnknown);
-        $('composition-chart').innerHTML = renderComposition(accounts);
-        $('quota-rings').innerHTML = renderQuotaRings(accounts);
-        $('accounts-list').innerHTML = accounts.length ? accounts.map(accountCard).join('') : `
+        if ($('request-mix-bars')) $('request-mix-bars').innerHTML = renderRequestMix(totalRequests, totalUnknown);
+        if ($('composition-chart')) $('composition-chart').innerHTML = renderComposition(accounts);
+        if ($('quota-rings')) $('quota-rings').innerHTML = renderQuotaRings(accounts);
+        if ($('request-log')) $('request-log').innerHTML = renderRequestLog(request_log);
+        if ($('request-log-count')) $('request-log-count').textContent = `${request_log.length} recent`;
+        if ($('accounts-list')) $('accounts-list').innerHTML = accounts.length ? accounts.map(accountCard).join('') : `
           <div class="empty-state">
             <b>No accounts configured</b>
             <p>Add Cloudflare account IDs and API tokens locally. The proxy will stay locked until setup is complete.</p>
@@ -894,13 +937,13 @@ def _dashboard_script() -> str:
           const total = Number(account.total_tokens || 0);
           const width = Math.max(2, Math.round((total / maxTokens) * 100));
           return `
-            <div class="bar-row">
-              <div class="bar-label">
+            <div style="margin-bottom: 8px;">
+              <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; color: var(--text); font-weight: 500;">
                 <b>${escapeHtml(account.name)}</b>
-                <span>${formatInt(total)} tokens</span>
+                <span style="color: var(--muted); font-family: var(--mono);">${formatInt(total)} tokens</span>
               </div>
-              <div class="bar-track">
-                <i class="bar-fill fill-${index % 4}" style="width: ${width}%"></i>
+              <div style="width: 100%; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; position: relative;">
+                <div style="width: ${width}%; height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.3s ease;"></div>
               </div>
             </div>`;
         }).join('');
@@ -993,6 +1036,7 @@ def _dashboard_script() -> str:
       
       if (window.location.search.includes('saved=1') || window.location.search.includes('error=')) {
          activateTab('tab-settings');
+         history.replaceState({}, document.title, window.location.pathname);
       }
       
       const list = document.getElementById('account-setup-list');
@@ -1021,22 +1065,19 @@ def _dashboard_script() -> str:
 
 def _account_bars(snapshots: list[tuple[CloudflareAccount, dict[str, object]]]) -> str:
     if not snapshots:
-        return '<div class="chart-empty" style="color: var(--muted); font-size: 12px; text-align: center; padding: 20px;">No accounts active</div>'
+        return '<div class="chart-empty" style="color: var(--muted); font-size: 13px; text-align: center; padding: 20px;">No accounts active</div>'
     max_tokens = max((int(item["total_tokens"]) for _, item in snapshots), default=0) or 1
-    colors = ["#ff00a0", "#00f0ff", "#ff00a0", "#00f0ff"]
     bars_html = []
     for index, (account, item) in enumerate(snapshots):
         pct = max(2, int((int(item['total_tokens']) / max_tokens) * 100))
-        color = colors[index % len(colors)]
-        glow = f"box-shadow: 0 0 8px {color};"
         bars_html.append(f'''
         <div style="margin-bottom: 8px;">
-          <div style="display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; color: var(--text);">
+          <div style="display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 6px; color: var(--text); font-weight: 500;">
             <b>{escape(account.name)}</b>
             <span style="color: var(--muted); font-family: var(--mono);">{_format_int(int(item['total_tokens']))} tokens</span>
           </div>
-          <div style="width: 100%; height: 8px; background: rgba(255,255,255,0.03); border-radius: 4px; overflow: hidden; position: relative;">
-            <div style="width: {pct}%; height: 100%; background: {color}; {glow} border-radius: 4px;"></div>
+          <div style="width: 100%; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; position: relative;">
+            <div style="width: {pct}%; height: 100%; background: var(--accent); border-radius: 4px; transition: width 0.3s ease;"></div>
           </div>
         </div>
         ''')
@@ -1115,120 +1156,90 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>__TITLE__</title>
   <style>
-        :root {
-      color-scheme: dark;
-      --bg: #0a0e17;
-      --bg-rail: #121824;
-      --panel: #121824;
-      --panel-raised: #182030;
-      --line: #1e293b;
-      --line-strong: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --quiet: #64748b;
-      --accent: #00f0ff;
-      --accent-ink: #0a0e17;
-      --warn: #ff00a0;
+            :root {
+      color-scheme: light;
+      --bg: #fafafa;
+      --bg-rail: #f4f4f5;
+      --panel: #ffffff;
+      --panel-raised: #ffffff;
+      --line: #e4e4e7;
+      --line-strong: #d4d4d8;
+      --text: #09090b;
+      --muted: #71717a;
+      --quiet: #a1a1aa;
+      --accent: #ff0063;
+      --accent-ink: #ffffff;
+      --warn: #ea580c;
       --danger: #ef4444;
       --success: #10b981;
-      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
-      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
     }
     :root[data-theme="dark"] {
       color-scheme: dark;
-      --bg: #0a0e17;
-      --bg-rail: #121824;
-      --panel: #121824;
-      --panel-raised: #182030;
-      --line: #1e293b;
-      --line-strong: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --quiet: #64748b;
-      --accent: #00f0ff;
-      --accent-ink: #0a0e17;
-      --warn: #ff00a0;
+      --bg: #09090b;
+      --bg-rail: #18181b;
+      --panel: #09090b;
+      --panel-raised: #18181b;
+      --line: #27272a;
+      --line-strong: #3f3f46;
+      --text: #fafafa;
+      --muted: #a1a1aa;
+      --quiet: #71717a;
+      --accent: #ff0063;
+      --accent-ink: #ffffff;
+      --warn: #f97316;
       --danger: #ef4444;
       --success: #10b981;
     }
     * { box-sizing: border-box; }
     html, body { min-height: 100%; margin: 0; background: var(--bg); color: var(--text); }
-    body {
-      background-image: radial-gradient(rgba(0, 240, 255, 0.015) 1px, transparent 0),
-                        radial-gradient(rgba(255, 0, 160, 0.015) 1px, transparent 0),
-                        url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120' viewBox='0 0 120 120'%3E%3Cpath d='M0 20 L20 20 L30 30 L60 30 L70 20 L100 20 M10 50 L10 80 L20 90 L80 90 M90 50 L90 70 L80 80' stroke='rgba(0, 240, 255, 0.02)' stroke-width='1.5' fill='none'/%3E%3Cpath d='M40 0 L40 10 L50 20 L90 20 M30 80 L30 110 L45 110' stroke='rgba(255, 0, 160, 0.015)' stroke-width='1.5' fill='none'/%3E%3Ccircle cx='30' cy='30' r='2' fill='rgba(0, 240, 255, 0.1)'/%3E%3Ccircle cx='80' cy='90' r='2' fill='rgba(255, 0, 160, 0.1)'/%3E%3C/svg%3E");
-      background-size: 120px 120px;
-    }
+    body { background: var(--bg); }
     .stats {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 16px;
     }
     .stat-card {
-      background: var(--panel);
-      border-radius: 14px;
-      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-start;
+      gap: 12px;
+      position: relative;
+    }
+    .stat-header {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.2);
-      border: 1px solid rgba(255, 255, 255, 0.03);
-      position: relative;
-      overflow: hidden;
+      width: 100%;
     }
-    .stat-card::after {
-      content: '';
-      position: absolute;
-      bottom: 0;
-      left: 0;
-      right: 0;
-      height: 2px;
-      opacity: 0.8;
+    .stat-title {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--muted);
     }
-    .stat-card.pink-glow::after {
-      background: #ff00a0;
-      box-shadow: 0 0 8px #ff00a0;
-    }
-    .stat-card.cyan-glow::after {
-      background: #00f0ff;
-      box-shadow: 0 0 8px #00f0ff;
+    .stat-value {
+      font-size: 32px;
+      font-weight: 700;
+      line-height: 1;
+      color: var(--text);
+      font-family: var(--mono);
+      margin-bottom: 4px;
     }
     .stat-icon {
-      width: 40px;
-      height: 40px;
-      border-radius: 10px;
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
       display: flex;
       align-items: center;
       justify-content: center;
     }
-    .pink-icon {
-      background: rgba(255, 0, 160, 0.1);
-      color: #ff00a0;
-      filter: drop-shadow(0 0 4px rgba(255, 0, 160, 0.2));
-    }
-    .cyan-icon {
-      background: rgba(0, 240, 255, 0.1);
-      color: #00f0ff;
-      filter: drop-shadow(0 0 4px rgba(0, 240, 255, 0.2));
-    }
-    .stat-info {
-      flex: 1;
-      margin-left: 14px;
-      display: flex;
-      flex-direction: column;
-    }
-    .stat-info b {
-      font-size: 20px;
-      line-height: 1.2;
-      color: var(--text);
-      font-family: var(--mono);
-    }
-    .stat-info span {
-      font-size: 11px;
-      color: var(--muted);
-    }
+    .pink-icon { background: color-mix(in srgb, var(--accent) 10%, transparent); color: var(--accent); }
+    .cyan-icon { background: color-mix(in srgb, var(--text) 5%, transparent); color: var(--text); }
     .stat-sparkline {
+      width: 100%;
       opacity: 0.85;
+      margin-top: auto;
     }
 
     body { font-family: var(--sans); font-size: 14px; line-height: 1.45; }
@@ -1240,21 +1251,21 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .wrap.dashboard-shell { width: min(1120px, 100%); }
     .card, .dashboard-section, .chart-panel, .mini-chart-panel, .endpoint-panel, .quota-panel, .account-card {
       background: var(--panel);
-      border: 0;
+      border: 1px solid var(--line);
       border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 4px 20px rgba(0, 240, 255, 0.03), 0 4px 20px rgba(255, 0, 160, 0.03);
+      padding: 32px;
+      box-shadow: 0 4px 20px rgba(0, 0, 0, 0.03);
       transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
-    .account-card:hover { transform: translateY(-2px); box-shadow: 0 8px 32px rgba(255, 0, 127, 0.08); }
-    .dashboard-shell > .card { padding: 0; background: transparent; border: 0; border-radius: 0; }
+    .account-card:hover { transform: translateY(-2px); box-shadow: 0 8px 30px rgba(0, 0, 0, 0.06); border-color: var(--accent); }
+    .dashboard-shell > .card { padding: 0; background: transparent; border: 0; border-radius: 0; box-shadow: none; }
     .brand { display: flex; align-items: center; gap: 14px; margin-bottom: 18px; }
     .logo { width: 36px; height: 36px; display: grid; place-items: center; background: var(--panel); border: 0; border-radius: 10px; }
     .terminal { width: 14px; height: 10px; border: 1px solid var(--accent); border-radius: 3px; }
     h1, h2, h3, p { margin-top: 0; }
-    h1 { margin-bottom: 2px; font-size: 20px; letter-spacing: -0.02em; }
-    h2 { margin-bottom: 10px; font-size: 22px; letter-spacing: -0.02em; }
-    h3 { margin-bottom: 0; font-size: 14px; font-weight: 650; letter-spacing: -0.01em; }
+    h1 { margin-bottom: 2px; font-size: 24px; font-weight: 700; letter-spacing: -0.03em; }
+    h2 { margin-bottom: 12px; font-size: 28px; font-weight: 700; letter-spacing: -0.03em; }
+    h3 { margin-bottom: 0; font-size: 16px; font-weight: 600; letter-spacing: -0.02em; }
     .subtitle, .muted, .footnote { color: var(--muted); }
     .dashboard-shell .brand { display: none; }
     .top-nav {
@@ -1262,12 +1273,13 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
       align-items: center;
       justify-content: space-between;
       gap: 20px;
-      padding: 16px 24px;
-      background: var(--bg);
+      padding: 16px 32px;
+      background: color-mix(in srgb, var(--bg) 80%, transparent);
+      backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--line);
       position: sticky;
       top: 0;
-      z-index: 10;
+      z-index: 50;
     }
     .nav-brand {
       display: flex;
@@ -1362,10 +1374,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .meter { height: 8px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 0; }
     .meter i { display: block; height: 100%; border-radius: inherit; background: var(--accent); transition: width 180ms ease-out; }
     .meter.large { height: 10px; margin-top: 14px; }
-    .stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
-    .stats div { padding: 16px; background: var(--panel); border: 0; border-radius: 12px; }
-    .stats b { display: block; margin-bottom: 4px; font-size: 26px; line-height: 1; }
-    .stats span { color: var(--muted); font-size: 12px; }
+
     .chart-grid { display: grid; grid-template-columns: minmax(280px, 0.8fr) minmax(0, 1.2fr); gap: 12px; }
     .mini-chart-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
     .donut-wrap { position: relative; display: grid; place-items: center; min-height: 198px; }
@@ -1386,10 +1395,22 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .bar-label b { color: var(--text); font-weight: 600; }
     .bar-track { height: 9px; overflow: hidden; border-radius: 999px; background: var(--bg); border: 0; }
     .bar-fill { display: block; height: 100%; border-radius: inherit; }
-    .fill-0 { background: #ff00a0; }
-    .fill-1 { background: #00f0ff; }
-    .fill-2 { background: #ff00a0; }
-    .fill-3 { background: #00f0ff; }
+    .request-log { display: grid; gap: 10px; max-height: 360px; overflow: auto; padding-right: 4px; }
+    .request-log-row { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(220px, 0.8fr); gap: 10px 18px; align-items: center; padding: 12px; border-radius: 12px; background: var(--bg-rail); border: 1px solid var(--line); }
+    .request-log-main { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .request-log-main div { min-width: 0; }
+    .request-log-main b { display: block; overflow: hidden; color: var(--text); font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+    .request-log-main span:not(.request-status), .request-log-meta { color: var(--muted); font-size: 12px; }
+    .request-log-meta { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px 12px; }
+    .request-log-row code { grid-column: 1 / -1; overflow: auto; color: var(--quiet); font-size: 11px; white-space: nowrap; }
+    .request-status { display: inline-flex; align-items: center; justify-content: center; min-width: 46px; border-radius: 999px; padding: 5px 8px; background: var(--panel); color: var(--muted); font-family: var(--mono); font-size: 12px; font-weight: 700; }
+    .request-status.ok { color: var(--success); background: color-mix(in oklch, var(--success) 12%, var(--panel)); }
+    .request-status.warn { color: var(--warn); background: color-mix(in oklch, var(--warn) 14%, var(--panel)); }
+    .request-status.error { color: var(--danger); background: color-mix(in oklch, var(--danger) 14%, var(--panel)); }
+    .fill-0 { background: var(--text); }
+    .fill-1 { background: var(--muted); }
+    .fill-2 { background: var(--text); }
+    .fill-3 { background: var(--muted); }
     .spark-bars { display: flex; align-items: flex-end; justify-content: center; gap: 28px; min-height: 128px; }
     .spark-row { display: grid; grid-template-rows: auto 1fr auto; align-items: end; justify-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
     .spark-row i { width: 28px; height: 88px; display: flex; align-items: flex-end; padding: 2px; background: var(--bg); border: 0; border-radius: 8px; }
@@ -1405,10 +1426,10 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     .ring-chip svg { width: 42px; height: 42px; flex: 0 0 auto; transform: rotate(-90deg); }
     .ring-track { stroke: var(--bg); stroke-width: 6; fill: none; }
     .ring-value { stroke-width: 6; fill: none; stroke-linecap: round; }
-    .fill-stroke-0 { stroke: #ff00a0; }
-    .fill-stroke-1 { stroke: #00f0ff; }
-    .fill-stroke-2 { stroke: #ff00a0; }
-    .fill-stroke-3 { stroke: #00f0ff; }
+    .fill-stroke-0 { stroke: var(--text); }
+    .fill-stroke-1 { stroke: var(--muted); }
+    .fill-stroke-2 { stroke: var(--text); }
+    .fill-stroke-3 { stroke: var(--muted); }
     .ring-chip span { min-width: 0; color: var(--quiet); font-size: 12px; }
     .ring-chip b { display: block; color: var(--text); font-family: var(--mono); font-size: 13px; }
     .endpoint-panel label { display: block; color: var(--muted); font-size: 12px; }
@@ -1442,6 +1463,8 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
       main { padding: 14px; }
       .dashboard-hero, .info-strip { flex-direction: column; align-items: stretch; }
       .stats, .chart-grid, .mini-chart-grid { grid-template-columns: 1fr; }
+      .request-log-row { grid-template-columns: 1fr; }
+      .request-log-meta { justify-content: flex-start; }
       .quota-grid, .field-grid { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 560px) {
