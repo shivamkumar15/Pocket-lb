@@ -12,6 +12,11 @@ OpenCode / Cline / Aider / any OpenAI-compatible client
   -> ...
 ```
 
+## Screenshots <img width="1320" height="824" alt="2026-07-02-212503" src="https://github.com/user-attachments/assets/30a1f63e-f3ca-4fe7-b464-6fe9241a2521" />
+<img width="1842" height="887" alt="2026-07-02-210831" src="https://github.com/user-attachments/assets/d2ae3c45-7931-45bb-9e1a-3ca1cdea2c00" />
+<img width="1866" height="933" alt="2026-07-02-204911" src="https://github.com/user-attachments/assets/8ad14e61-5adf-403f-94ed-41b76fdfaadd" />
+
+
 The proxy forwards local `/v1/*` requests to Cloudflare Workers AI's OpenAI-compatible path:
 
 ```text
