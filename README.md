@@ -240,6 +240,3 @@ Pocket-lb/
 └── README.md
 ```
 
-## License
-
-See repository for license details.
