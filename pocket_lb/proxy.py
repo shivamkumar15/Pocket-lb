@@ -37,10 +37,23 @@ class AccountPool:
         self._accounts = accounts
         self._cursor = itertools.count()
 
-    def next_attempts(self, max_attempts: int) -> list[CloudflareAccount]:
-        attempts = min(max_attempts, len(self._accounts))
+    def next_attempts(self, max_attempts: int, usage_tracker: 'UsageTracker | None' = None) -> list[CloudflareAccount]:
+        candidates = self._accounts
+        if usage_tracker:
+            valid = []
+            for acc in self._accounts:
+                rem = usage_tracker.snapshot(acc).get("remaining_tokens")
+                if rem is None or rem > 0:
+                    valid.append(acc)
+            if valid:
+                candidates = valid
+
+        if not candidates:
+            return []
+
+        attempts = min(max_attempts, len(candidates))
         start = next(self._cursor)
-        return [self._accounts[(start + offset) % len(self._accounts)] for offset in range(attempts)]
+        return [candidates[(start + offset) % len(candidates)] for offset in range(attempts)]
 
 
 class UsageTracker:
@@ -339,7 +352,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         last_error: Exception | None = None
         attempts_log = []
 
-        attempted_accounts = pool.next_attempts(settings.max_attempts)
+        attempted_accounts = pool.next_attempts(settings.max_attempts, usage_tracker)
         for i, account in enumerate(attempted_accounts):
             headers = dict(incoming_headers)
             headers["authorization"] = f"Bearer {account.api_token}"
