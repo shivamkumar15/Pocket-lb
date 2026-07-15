@@ -314,6 +314,50 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return {"accounts": accounts, "request_log": request_log.snapshot()}
 
+
+    @app.get("/v1/models")
+    async def get_models():
+        if client is None:
+            return JSONResponse({"error": "Proxy client is not ready."}, status_code=503)
+        if not settings.accounts:
+            return JSONResponse({"error": "No Cloudflare accounts configured.", "setup_url": "/setup"}, status_code=428)
+            
+        account = settings.accounts[0]
+        url = f"https://api.cloudflare.com/client/v4/accounts/{account.account_id}/ai/models/search"
+        headers = {"Authorization": f"Bearer {account.api_token}"}
+        
+        try:
+            resp = await client.get(url, headers=headers, timeout=10.0)
+            resp.raise_for_status()
+            cf_models = [m["name"] for m in resp.json().get("result", []) if "name" in m]
+        except Exception as e:
+            print(f"[LB] Error fetching models from Cloudflare: {e}", flush=True)
+            cf_models = []
+            
+        all_model_names = list(settings.model_mapping.keys()) + cf_models
+        
+        seen = set()
+        unique_models = []
+        for m in all_model_names:
+            if m not in seen:
+                seen.add(m)
+                unique_models.append(m)
+                
+        models_data = [
+            {
+                "id": m_name,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "cloudflare" if m_name.startswith("@cf/") else "pocket_lb"
+            }
+            for m_name in unique_models
+        ]
+        
+        return JSONResponse({
+            "object": "list",
+            "data": models_data
+        })
+
     @app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def proxy(path: str, request: Request) -> Response:
         if client is None:
