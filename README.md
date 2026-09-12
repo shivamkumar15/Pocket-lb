@@ -135,16 +135,42 @@ The local API key is not used for Cloudflare authentication. Cloudflare credenti
 
 ### Model Mappings
 
-Set up model mappings in the **Settings** tab of the dashboard to translate standard model names to Cloudflare Workers AI models:
+Set up model mappings in the **Settings** tab of the dashboard to translate standard model names to Cloudflare Workers AI models.
+All Text Generation + Text Embeddings models in the Workers AI free allocation (10,000 Neurons/day, shared) are pre-mapped with friendly aliases — verified against the live catalog. You can also use any full Cloudflare model ID directly (e.g. `@cf/zai-org/glm-5.2`).
 
 ```text
-gpt-4o          -> @cf/meta/llama-3.1-8b-instruct
-gpt-4o-mini     -> @cf/meta/llama-3.1-8b-instruct
-claude-3-5-sonnet -> @cf/meta/llama-3.1-8b-instruct
-glm-5.2         -> @cf/zai-org/glm-5.2
-```
+# Generic OpenAI / Claude compatibility
+gpt-4o              -> @cf/meta/llama-3.1-8b-instruct-fp8
+gpt-4o-mini         -> @cf/meta/llama-3.2-3b-instruct
+gpt-4.1             -> @cf/openai/gpt-oss-120b
+gpt-4.1-mini        -> @cf/openai/gpt-oss-20b
+claude-3-5-sonnet   -> @cf/mistralai/mistral-small-3.1-24b-instruct
 
-You can also use Cloudflare model names directly (e.g. `@cf/zai-org/glm-5.2`).
+# Kimi / GLM (coding)
+kimi-k2.7-code      -> @cf/moonshotai/kimi-k2.7-code
+kimi-k2.6           -> @cf/moonshotai/kimi-k2.6
+glm-5.2             -> @cf/zai-org/glm-5.2
+glm-5.3             -> @cf/zai-org/glm-5.3
+glm-5.3-flash       -> @cf/zai-org/glm-5.3-flash
+glm-4.7-flash       -> @cf/zai-org/glm-4.7-flash
+
+# OpenAI open-weights / DeepSeek / Qwen
+gpt-oss-120b        -> @cf/openai/gpt-oss-120b
+gpt-oss-20b         -> @cf/openai/gpt-oss-20b
+deepseek-v4-pro     -> @cf/deepseek-ai/deepseek-v4-pro-0813
+deepseek-v4-flash   -> @cf/deepseek-ai/deepseek-v4-flash-0731
+qwen2.5-coder-32b   -> @cf/qwen/qwen2.5-coder-32b-instruct
+qwen3-30b           -> @cf/qwen/qwen3-30b-a3b-fp8
+qwq-32b             -> @cf/qwen/qwq-32b
+
+# Llama / Gemma / Mistral / others
+llama-3.3-70b       -> @cf/meta/llama-3.3-70b-instruct-fp8-fast
+llama-4-scout       -> @cf/meta/llama-4-scout-17b-16e-instruct
+mistral-small-3.1   -> @cf/mistralai/mistral-small-3.1-24b-instruct
+gemma-4-26b         -> @cf/google/gemma-4-26b-a4b-it
+nemotron-120b       -> @cf/nvidia/nemotron-3-120b-a12b
+...plus every other free chat + embedding model (see config.example.json)
+```
 
 ### OpenCode
 
@@ -179,7 +205,9 @@ Created by the setup page. Git-ignored so secrets stay local.
   "request_timeout_seconds": 120.0,
   "max_attempts": 3,
   "model_mapping": {
-    "gpt-4o": "@cf/meta/llama-3.1-8b-instruct"
+    "gpt-4o": "@cf/meta/llama-3.1-8b-instruct-fp8",
+    "kimi-k2.7-code": "@cf/moonshotai/kimi-k2.7-code",
+    "glm-5.2": "@cf/zai-org/glm-5.2"
   },
   "accounts": [
     {
