@@ -41,37 +41,37 @@ class AccountPool:
     def report_rate_limit(self, account: CloudflareAccount, wait_seconds: float = 60.0) -> None:
         self._rate_limited_until[account.account_id] = time.time() + wait_seconds
 
+    def is_rate_limited(self, account: CloudflareAccount) -> bool:
+        return self._rate_limited_until.get(account.account_id, 0.0) > time.time()
+
     def next_attempts(self, max_attempts: int, usage_tracker: 'UsageTracker | None' = None) -> list[CloudflareAccount]:
-        candidates = self._accounts
         now = time.time()
-        
+
         # Filter out currently rate-limited accounts
-        available_candidates = [
-            acc for acc in candidates
+        available = [
+            acc for acc in self._accounts
             if self._rate_limited_until.get(acc.account_id, 0.0) < now
         ]
-        
+
         # Fallback to all candidates if all are rate-limited to at least try something
-        if not available_candidates:
-            available_candidates = candidates
-            
-        candidates = available_candidates
+        if not available:
+            available = list(self._accounts)
 
         if usage_tracker:
-            valid = []
-            for acc in self._accounts:
+            with_quota = []
+            for acc in available:
                 rem = usage_tracker.snapshot(acc).get("remaining_tokens")
                 if rem is None or rem > 0:
-                    valid.append(acc)
-            if valid:
-                candidates = valid
+                    with_quota.append(acc)
+            if with_quota:
+                available = with_quota
 
-        if not candidates:
+        if not available:
             return []
 
-        attempts = len(candidates)
         start = next(self._cursor)
-        return [candidates[(start + offset) % len(candidates)] for offset in range(attempts)]
+        ordered = [available[(start + offset) % len(available)] for offset in range(len(available))]
+        return ordered[:max(1, max_attempts)]
 
 
 class UsageTracker:
@@ -224,6 +224,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     request_log = RequestLog(log_path=log_path)
     timeout = httpx.Timeout(settings.request_timeout_seconds)
     client: httpx.AsyncClient | None = None
+    # Cache the upstream model catalog so every `GET /v1/models` from a
+    # client doesn't burn a live Cloudflare API call.
+    models_cache: dict[str, object] = {"at": 0.0, "names": []}
+    MODELS_CACHE_TTL_SECONDS = 600.0
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -239,16 +243,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/logo.png")
     async def get_logo():
         from fastapi.responses import FileResponse
-        import os
-        path = "hud-dashboard/public/logo.png"
-        if os.path.exists(path):
-            return FileResponse(path)
+        candidates = [
+            Path(settings.config_path).parent / "hud-dashboard" / "public" / "logo.png",
+            Path(__file__).resolve().parent.parent / "hud-dashboard" / "public" / "logo.png",
+            Path.cwd() / "hud-dashboard" / "public" / "logo.png",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return FileResponse(str(path))
         from fastapi import Response
         return Response(status_code=404)
 
     @app.get("/", response_class=HTMLResponse)
     async def dashboard(saved: bool = False, error: str | None = None) -> str:
-        return _dashboard_html(settings, usage_tracker, request_log, saved=saved, error=error)
+        limited = {a.account_id for a in settings.accounts if pool.is_rate_limited(a)}
+        return _dashboard_html(settings, usage_tracker, request_log, saved=saved, error=error, rate_limited_ids=limited)
 
     @app.get("/setup")
     async def setup_form() -> RedirectResponse:
@@ -274,9 +283,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     return RedirectResponse(url=f"/?error={err_msg}", status_code=303)
                 account = {"name": name, "account_id": account_id, "api_token": api_token}
                 if token_limit:
-                    account["token_limit"] = int(token_limit)
+                    try:
+                        account["token_limit"] = int(token_limit)
+                    except ValueError:
+                        from urllib.parse import quote
+                        err_msg = quote(f"Account #{index}: token limit must be a number.")
+                        return RedirectResponse(url=f"/?error={err_msg}", status_code=303)
                 if reset_period_hours:
-                    account["reset_period_hours"] = int(reset_period_hours)
+                    try:
+                        account["reset_period_hours"] = int(reset_period_hours)
+                    except ValueError:
+                        from urllib.parse import quote
+                        err_msg = quote(f"Account #{index}: reset window must be a number of hours.")
+                        return RedirectResponse(url=f"/?error={err_msg}", status_code=303)
                 accounts.append(account)
 
         if not accounts:
@@ -327,6 +346,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "account_id": _mask_account_id(account.account_id),
                     "token_limit": account.token_limit,
                     "reset_period_hours": account.reset_period_hours,
+                    "rate_limited": pool.is_rate_limited(account),
                     **item,
                 }
             )
@@ -343,14 +363,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         account = settings.accounts[0]
         url = f"https://api.cloudflare.com/client/v4/accounts/{account.account_id}/ai/models/search"
         headers = {"Authorization": f"Bearer {account.api_token}"}
-        
-        try:
-            resp = await client.get(url, headers=headers, timeout=10.0)
-            resp.raise_for_status()
-            cf_models = [m["name"] for m in resp.json().get("result", []) if "name" in m]
-        except Exception as e:
-            print(f"[LB] Error fetching models from Cloudflare: {e}", flush=True)
-            cf_models = []
+
+        cached_at = float(models_cache["at"])
+        cached_names = list(models_cache["names"])  # type: ignore[arg-type]
+        if time.time() - cached_at < MODELS_CACHE_TTL_SECONDS and cached_names:
+            cf_models = cached_names
+        else:
+            try:
+                resp = await client.get(url, headers=headers, timeout=10.0)
+                resp.raise_for_status()
+                cf_models = [m["name"] for m in resp.json().get("result", []) if "name" in m]
+                models_cache["at"] = time.time()
+                models_cache["names"] = cf_models
+            except Exception as e:
+                print(f"[LB] Error fetching models from Cloudflare: {e}", flush=True)
+                cf_models = cached_names
             
         all_model_names = list(settings.model_mapping.keys()) + cf_models
         
@@ -412,6 +439,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         incoming_headers = locals().get("_request_headers_cache", _forward_headers(request))
         last_response: httpx.Response | None = None
         last_error: Exception | None = None
+        last_detail: str | None = None
         attempts_log = []
 
         attempted_accounts = pool.next_attempts(settings.max_attempts, usage_tracker)
@@ -470,6 +498,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 pool.report_rate_limit(account, wait_seconds)
 
             last_response = upstream_response
+            last_detail = await _read_error_detail(upstream_response)
             await upstream_response.aclose()
 
         if last_response is not None:
@@ -486,10 +515,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "duration_ms": int((time.time() - started_at) * 1000),
                 }
             )
-            return JSONResponse(
-                {"error": f"All Cloudflare accounts failed or were rate limited. Tried: {tried_names}", "last_status": last_response.status_code},
-                status_code=last_response.status_code,
-            )
+            body: dict[str, object] = {
+                "error": f"All Cloudflare accounts failed or were rate limited. Tried: {tried_names}",
+                "last_status": last_response.status_code,
+            }
+            if last_detail:
+                body["upstream_detail"] = last_detail
+            return JSONResponse(body, status_code=last_response.status_code)
 
         request_log.record(
             {
@@ -510,6 +542,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     return app
+
+
+async def _read_error_detail(response: httpx.Response, limit: int = 2000) -> str | None:
+    """Best-effort read of a failed upstream body so clients see the real error."""
+    try:
+        raw = await response.aread()
+    except Exception:
+        return None
+    if not raw:
+        return None
+    text = raw[:limit].decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return text or None
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if isinstance(errors, list) and errors:
+        first = errors[0]
+        if isinstance(first, dict) and first.get("message"):
+            return str(first["message"])[:limit]
+    if isinstance(payload, dict) and payload.get("error"):
+        return str(payload["error"])[:limit]
+    return text or None
 
 
 def _forward_headers(request: Request) -> dict[str, str]:
@@ -555,6 +610,7 @@ async def _tracked_response(response: httpx.Response, account: CloudflareAccount
 def _stream_response(response: httpx.Response, account: CloudflareAccount, usage_tracker: UsageTracker) -> StreamingResponse:
     async def body() -> AsyncIterator[bytes]:
         buffer = b""
+        saw_usage = False
         try:
             async for chunk in response.aiter_bytes():
                 buffer += chunk
@@ -566,11 +622,16 @@ def _stream_response(response: httpx.Response, account: CloudflareAccount, usage
                             try:
                                 payload = json.loads(data_str.decode("utf-8"))
                                 if payload.get("usage"):
+                                    saw_usage = True
                                     usage_tracker.record(account, payload)
                             except Exception:
                                 pass
                 yield chunk
         finally:
+            if not saw_usage:
+                # Stream carried no usage payload: still count the request
+                # so dashboard totals stay truthful.
+                usage_tracker.record(account, None)
             await response.aclose()
 
     return StreamingResponse(
@@ -581,11 +642,17 @@ def _stream_response(response: httpx.Response, account: CloudflareAccount, usage
     )
 
 
-def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log: RequestLog, saved: bool = False, error: str | None = None) -> str:
+def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log: RequestLog, saved: bool = False, error: str | None = None, rate_limited_ids: set[str] | None = None) -> str:
     base_url = f"http://{settings.host}:{settings.port}/v1"
     status_label = "Online" if settings.accounts else "Setup required"
     status_class = "status-ok" if settings.accounts else "status-warn"
     snapshots = [(account, usage_tracker.snapshot(account)) for account in settings.accounts]
+    log_entries = request_log.snapshot()
+    limited = rate_limited_ids or set()
+    live_status = {
+        account.account_id: _account_live_status(account.name, log_entries, account.account_id in limited)
+        for account in settings.accounts
+    }
     
     existing = settings.accounts or [CloudflareAccount(name="", account_id="", api_token="")]
     account_rows = "".join(_account_setup_block(index, account) for index, account in enumerate(existing, start=1))
@@ -601,6 +668,8 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log
     total_unknown = sum(int(item["unknown_token_responses"]) for _, item in snapshots)
     configured_quota_count = sum(1 for account, _ in snapshots if account.token_limit)
     total_usage_percent = 0 if total_limit == 0 else min(100, int((total_observed / total_limit) * 100))
+    quota_pct_label = f"{total_usage_percent}%" if total_limit else "—"
+    quota_sub_label = "Utilized" if total_limit else "No quota set"
     rows = "".join(
         f"""
         <div class="account-card">
@@ -609,7 +678,7 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log
               <b>{escape(account.name)}</b>
               <code>{escape(_mask_account_id(account.account_id))}</code>
             </div>
-            <span class="account-status">Active</span>
+            <span class="account-status {live_status[account.account_id][1]}">{live_status[account.account_id][0]}</span>
           </div>
           <div class="account-total">
             <strong>{_format_int(int(item['total_tokens']))}</strong>
@@ -710,8 +779,8 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log
                             stroke-dasharray="{int(126 * total_usage_percent / 100)} 126" />
                     </svg>
                     <div style="text-align: center; margin-bottom: 12px; z-index: 2;">
-                      <div id="quota-percent" style="font-size: 36px; font-weight: 800; color: var(--text); font-family: var(--mono); line-height: 1;">{total_usage_percent}%</div>
-                      <div style="font-size: 13px; color: var(--muted); margin-top: 4px;">Utilized</div>
+                      <div id="quota-percent" style="font-size: 36px; font-weight: 800; color: var(--text); font-family: var(--mono); line-height: 1;">{quota_pct_label}</div>
+                      <div id="quota-sublabel" style="font-size: 13px; color: var(--muted); margin-top: 4px;">{quota_sub_label}</div>
                     </div>
                   </div>
                   
@@ -826,6 +895,38 @@ def _dashboard_html(settings: Settings, usage_tracker: UsageTracker, request_log
     )
 
 
+def _account_live_status(account_name: str, log_entries: list[dict[str, object]], rate_limited: bool) -> tuple[str, str]:
+    """Truthful per-account badge derived from real recent attempts.
+
+    Returns (label, css_modifier). Empty modifier means the default green.
+    """
+    if rate_limited:
+        return ("Rate limited", "status-warn")
+    last: object = None
+    for entry in log_entries:  # newest first
+        attempts = entry.get("attempts")
+        if not isinstance(attempts, list):
+            continue
+        for attempt in attempts:
+            if isinstance(attempt, dict) and attempt.get("account") == account_name:
+                last = attempt.get("status")
+                break
+        if last is not None:
+            break
+    if last is None:
+        return ("Idle", "status-muted")
+    if last == "network-error":
+        return ("Unreachable", "status-error")
+    code = _safe_int(last)
+    if 200 <= code < 300:
+        return ("Active", "")
+    if code == 429:
+        return ("Rate limited", "status-warn")
+    if code >= 400:
+        return (f"Error {code}", "status-error")
+    return ("Idle", "status-muted")
+
+
 def _request_log_rows(entries: list[dict[str, object]]) -> str:
     if not entries:
         return '<div class="chart-empty">No proxied requests yet. Send traffic to <code>/v1</code> to populate this log.</div>'
@@ -902,8 +1003,23 @@ def _dashboard_script() -> str:
       }[char]));
       const percent = (account) => {
         if (!account.token_limit) return 0;
-        if (!account.token_limit) return 0;
         return Math.min(100, Math.floor((Number(account.total_tokens || 0) / account.token_limit) * 100));
+      };
+      const accountStatus = (account, log = []) => {
+        if (account.rate_limited) return ['Rate limited', 'status-warn'];
+        let last = null;
+        for (const entry of log) {
+          const attempts = entry.attempts || [];
+          const hit = attempts.find((a) => a && a.account === account.name);
+          if (hit) { last = hit.status; break; }
+        }
+        if (last === null || last === undefined) return ['Idle', 'status-muted'];
+        if (last === 'network-error') return ['Unreachable', 'status-error'];
+        const code = Number(last || 0);
+        if (code >= 200 && code < 300) return ['Active', ''];
+        if (code === 429) return ['Rate limited', 'status-warn'];
+        if (code >= 400) return [`Error ${code}`, 'status-error'];
+        return ['Idle', 'status-muted'];
       };
       const formatReset = (resetAt) => {
         if (!resetAt) return 'Not set';
@@ -954,14 +1070,16 @@ def _dashboard_script() -> str:
             </div>`;
         }).join('');
       };
-      const accountCard = (account) => `
+      const accountCard = (account, log = []) => {
+        const [badge, badgeClass] = accountStatus(account, log);
+        return `
         <div class="account-card">
           <div class="account-top">
             <div>
               <b>${escapeHtml(account.name)}</b>
               <code>${escapeHtml(account.account_id)}</code>
             </div>
-            <span class="account-status">Active</span>
+            <span class="account-status ${badgeClass}">${escapeHtml(badge)}</span>
           </div>
           <div class="account-total">
             <strong>${formatInt(account.total_tokens)}</strong>
@@ -981,6 +1099,7 @@ def _dashboard_script() -> str:
             <span>Last used: <b>${timeAgo(account.last_used_at)}</b></span>
           </div>
         </div>`;
+      };
       const renderUsage = ({ accounts = [], request_log = [] }) => {
         const totalObserved = accounts.reduce((sum, account) => sum + Number(account.total_tokens || 0), 0);
         const totalLimit = accounts.reduce((sum, account) => sum + Number(account.token_limit || 0), 0);
@@ -992,22 +1111,19 @@ def _dashboard_script() -> str:
         $('quota-configured').textContent = `${configuredQuota}/${accounts.length} configured`;
         $('quota-observed').textContent = formatInt(totalObserved);
         const quotaPercent = totalLimit ? Math.min(100, Math.floor((totalObserved / totalLimit) * 100)) : 0;
-        if ($('quota-meter')) $('quota-meter').style.width = `${quotaPercent}%`;
-        $('quota-donut').style.strokeDasharray = `${quotaPercent} 100`;
-        $('quota-percent').textContent = `${quotaPercent}%`;
-        if ($('quota-remaining')) $('quota-remaining').textContent = formatOptionalInt(totalRemaining);
+        // Semicircle path length is ~126 (r=40): keep the same scale as first paint.
+        $('quota-donut').style.strokeDasharray = `${(126 * quotaPercent / 100).toFixed(1)} 126`;
+        $('quota-percent').textContent = totalLimit ? `${quotaPercent}%` : '—';
+        if ($('quota-sublabel')) $('quota-sublabel').textContent = totalLimit ? 'Utilized' : 'No quota set';
         $('quota-unknown').textContent = formatInt(totalUnknown);
         $('stat-accounts').textContent = formatInt(accounts.length);
         $('stat-requests').textContent = formatInt(totalRequests);
         $('stat-tokens').textContent = formatInt(totalObserved);
         $('stat-remaining').textContent = formatOptionalInt(totalRemaining);
         $('account-bars').innerHTML = renderBars(accounts);
-        if ($('request-mix-bars')) $('request-mix-bars').innerHTML = renderRequestMix(totalRequests, totalUnknown);
-        if ($('composition-chart')) $('composition-chart').innerHTML = renderComposition(accounts);
-        if ($('quota-rings')) $('quota-rings').innerHTML = renderQuotaRings(accounts);
         if ($('request-log')) $('request-log').innerHTML = renderRequestLog(request_log);
         if ($('request-log-count')) $('request-log-count').textContent = `${request_log.length} recent`;
-        if ($('accounts-list')) $('accounts-list').innerHTML = accounts.length ? accounts.map(accountCard).join('') : `
+        if ($('accounts-list')) $('accounts-list').innerHTML = accounts.length ? accounts.map((a) => accountCard(a, request_log)).join('') : `
           <div class="empty-state">
             <b>No accounts configured</b>
             <p>Add Cloudflare account IDs and API tokens locally. The proxy will stay locked until setup is complete.</p>
@@ -1035,47 +1151,6 @@ def _dashboard_script() -> str:
             </div>`;
         }).join('');
       };
-      const renderRequestMix = (totalRequests, totalUnknown) => {
-        const known = Math.max(0, totalRequests - totalUnknown);
-        const max = Math.max(known, totalUnknown, 1);
-        return [
-          ['Known', known, 'fill-0'],
-          ['Unknown', totalUnknown, 'fill-3'],
-        ].map(([label, value, fill]) => `
-          <div class="spark-row">
-            <span>${label}</span>
-            <i><b class="${fill}" style="height:${Math.max(8, Math.round((value / max) * 100))}%"></b></i>
-            <strong>${formatInt(value)}</strong>
-          </div>`).join('');
-      };
-      const renderComposition = (accounts) => {
-        const prompt = accounts.reduce((sum, account) => sum + Number(account.prompt_tokens || 0), 0);
-        const completion = accounts.reduce((sum, account) => sum + Number(account.completion_tokens || 0), 0);
-        const total = Math.max(prompt + completion, 1);
-        return `
-          <div class="composition-stack">
-            <i class="fill-1" style="width:${Math.max(2, Math.round((prompt / total) * 100))}%"></i>
-            <i class="fill-2" style="width:${Math.max(2, Math.round((completion / total) * 100))}%"></i>
-          </div>
-          <div class="composition-meta">
-            <span>Prompt <b>${formatInt(prompt)}</b></span>
-            <span>Completion <b>${formatInt(completion)}</b></span>
-          </div>`;
-      };
-      const renderQuotaRings = (accounts) => {
-        if (!accounts.length) return '<div class="chart-empty">No account quota data yet.</div>';
-        return accounts.slice(0, 6).map((account, index) => {
-          const used = percent(account);
-          return `
-            <div class="ring-chip">
-              <svg viewBox="0 0 42 42" aria-label="${escapeHtml(account.name)} quota">
-                <circle class="ring-track" cx="21" cy="21" r="15"></circle>
-                <circle class="ring-value fill-stroke-${index % 4}" cx="21" cy="21" r="15" style="stroke-dasharray:${used} 100"></circle>
-              </svg>
-              <span><b>${used}%</b>${escapeHtml(account.name)}</span>
-            </div>`;
-        }).join('');
-      };
       const refreshUsage = async () => {
         try {
           const response = await fetch('/usage', { headers: { accept: 'application/json' } });
@@ -1088,9 +1163,21 @@ def _dashboard_script() -> str:
 
       document.querySelectorAll('[data-copy]').forEach((button) => {
         button.addEventListener('click', async () => {
-          await navigator.clipboard.writeText(button.dataset.copy);
-          button.textContent = 'Copied';
-          setTimeout(() => button.textContent = 'Copy', 1200);
+          const done = () => {
+            button.textContent = 'Copied';
+            setTimeout(() => button.textContent = 'Copy', 1200);
+          };
+          try {
+            await navigator.clipboard.writeText(button.dataset.copy);
+            done();
+          } catch (error) {
+            const ta = document.createElement('textarea');
+            ta.value = button.dataset.copy;
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); done(); } catch (e) { /* clipboard unavailable */ }
+            ta.remove();
+          }
         });
       });
       if (themeButton) {
@@ -1121,7 +1208,13 @@ def _dashboard_script() -> str:
         });
       });
       
-      if (window.location.search.includes('saved=1') || window.location.search.includes('error=')) {
+      const params = new URLSearchParams(window.location.search);
+      const requestedTab = params.get('tab');
+      const tabIds = Array.from(tabBtns).map((b) => b.dataset.tab);
+      if (requestedTab && tabIds.includes(`tab-${requestedTab}`)) {
+         activateTab(`tab-${requestedTab}`);
+         history.replaceState({}, document.title, window.location.pathname);
+      } else if (window.location.search.includes('saved=1') || window.location.search.includes('error=')) {
          activateTab('tab-settings');
          history.replaceState({}, document.title, window.location.pathname);
       }
@@ -1140,6 +1233,8 @@ def _dashboard_script() -> str:
                 <label>Name <input name="name_${index}" placeholder="e.g. user@gmail.com" autocomplete="off"></label>
                 <label>Account ID <input name="account_id_${index}" autocomplete="off" placeholder="Cloudflare account ID"></label>
                 <label>API Token <input name="api_token_${index}" type="password" autocomplete="off" placeholder="Cloudflare API token"></label>
+                <label>Token limit (optional) <input name="token_limit_${index}" inputmode="numeric" autocomplete="off" placeholder="e.g. 10000000"></label>
+                <label>Reset window hours (optional) <input name="reset_period_hours_${index}" inputmode="numeric" autocomplete="off" placeholder="e.g. 24"></label>
               </div>
             </details>`);
         });
@@ -1223,6 +1318,8 @@ def _quota_rings(snapshots: list[tuple[CloudflareAccount, dict[str, object]]]) -
 
 
 def _account_setup_block(index: int, account: CloudflareAccount) -> str:
+    limit_value = "" if account.token_limit is None else str(account.token_limit)
+    reset_value = "" if account.reset_period_hours is None else str(account.reset_period_hours)
     return f"""
     <details {'open' if index == 1 else ''}>
       <summary>Cloudflare Account #{index}</summary>
@@ -1230,6 +1327,8 @@ def _account_setup_block(index: int, account: CloudflareAccount) -> str:
         <label>Name <input name="name_{index}" value="{escape(account.name)}" placeholder="e.g. user@gmail.com" autocomplete="off"></label>
         <label>Account ID <input name="account_id_{index}" value="{escape(account.account_id)}" autocomplete="off" placeholder="Cloudflare account ID"></label>
         <label>API Token <input name="api_token_{index}" value="{escape(account.api_token)}" type="password" autocomplete="off" placeholder="Cloudflare API token"></label>
+        <label>Token limit (optional) <input name="token_limit_{index}" value="{escape(limit_value)}" inputmode="numeric" autocomplete="off" placeholder="e.g. 10000000"></label>
+        <label>Reset window hours (optional) <input name="reset_period_hours_{index}" value="{escape(reset_value)}" inputmode="numeric" autocomplete="off" placeholder="e.g. 24"></label>
       </div>
     </details>
     """
@@ -1435,6 +1534,9 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
     }
     .status::before, .account-status::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: currentColor; }
     .status-warn { color: var(--warn); background: color-mix(in oklch, var(--warn) 14%, var(--panel)); border-color: color-mix(in oklch, var(--warn), var(--line) 40%); }
+    .account-status.status-warn { color: var(--warn); background: color-mix(in oklch, var(--warn) 14%, var(--panel)); border-color: color-mix(in oklch, var(--warn), var(--line) 40%); }
+    .account-status.status-error { color: var(--danger); background: color-mix(in oklch, var(--danger) 14%, var(--panel)); border-color: color-mix(in oklch, var(--danger), var(--line) 40%); }
+    .account-status.status-muted { color: var(--muted); background: transparent; border-color: var(--line-strong); }
     .dashboard-section, .stats, .chart-grid, .mini-chart-grid { margin-bottom: 16px; }
     .section-title { display: flex; justify-content: space-between; align-items: baseline; gap: 14px; margin-bottom: 16px; }
     .section-title span { color: var(--quiet); font-size: 12px; }
@@ -1571,7 +1673,7 @@ def _codex_shell(title: str, subtitle: str, body: str, shell_class: str = "compa
 <body>
   <nav class="top-nav">
     <div class="nav-brand">
-      <img src="/logo.png" style="height: 64px; object-fit: contain;" alt="Logo">
+      <img src="/logo.png" style="height: 64px; object-fit: contain;" alt="Logo" onerror="this.style.display='none'">
       <b>__TITLE__</b>
     </div>
     <div class="tab-pills">
