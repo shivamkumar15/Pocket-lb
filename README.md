@@ -26,11 +26,12 @@ https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1/*
 ## Features
 
 - **Multi-account load balancing** — round-robin requests across unlimited Cloudflare accounts.
-- **Automatic failover** — retries the next account on `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`.
-- **Model mappings** — map standard model names (e.g. `glm5.2 and other models` to any Cloudflare Workers AI model. Configure in the Settings tab.
+- **Automatic failover** — tries the next account on `400`, `401`, `403`, `404`, `408`, `409`, `410`, `425`, `429`, `500`, `502`, `503`, and `504`, up to `max_attempts` accounts per request. Accounts that return `429` are backed off (honors `Retry-After`, default 60s) and quota-exhausted accounts are skipped.
+- **Model mappings** — 50+ friendly aliases (e.g. `kimi-k2.7`, `glm-5.2`, `gpt-4o`) mapped to Cloudflare Workers AI models. Full `@cf/...` IDs work directly. View mappings in the Settings tab; edit them in `config.json`.
 - **Streaming support** — preserves Server-Sent Events (SSE) streaming and parses token usage from stream chunks.
-- **Token usage tracking** — records prompt, completion, and total tokens per account from both regular and streaming responses.
-- **Web dashboard** — live view of accounts, quota usage, per-account token distribution, model mappings, and endpoint info.
+- **Token usage tracking** — records prompt, completion, and total tokens per account from both regular and streaming responses. Streams that carry no usage data are counted as unknown-token responses so request totals stay accurate.
+- **Web dashboard** — live per-account status badges (`Active` / `Rate limited` / `Error N` / `Unreachable` / `Idle`), token distribution, request log with per-attempt breakdown, model mappings, and endpoint info. Auto-refreshes every 5s.
+- **Failure transparency** — when all accounts fail, the response includes the upstream error (`upstream_detail`) instead of a generic message.
 - **Dark/light theme** — toggle in the dashboard; dark mode uses near-black surfaces.
 - **Local-first security** — credentials are stored only in local `config.json` (git-ignored).
 - **Docker support** — ships with a `Dockerfile` and `docker-compose.yml`.
@@ -68,13 +69,7 @@ pocket-lb
 1. Open your browser and navigate to [http://localhost:2456/setup](http://localhost:2456/setup).
 2. Enter your Cloudflare Account ID and API Token. You can generate an API token from your Cloudflare dashboard (ensure it has "Workers AI" permissions).
 3. *(Optional)* Set token limits and reset windows to track your quota.
-4. Click "Save". This will securely create a local `config.json` file.
-
-**Step 6: Restart to apply changes**
-Stop the server in your terminal (`Ctrl+C`) and start it again to load the new configuration:
-```bash
-pocket-lb
-```
+4. Click "Save". This securely writes a local `config.json` file and applies immediately — no restart needed (restart is only required if you edit `config.json` by hand).
 
 ### Method 2: Docker Setup
 
@@ -92,23 +87,19 @@ docker-compose up -d
 ```
 
 **Step 3: Configure your accounts**
-Visit [http://localhost:2456/setup](http://localhost:2456/setup) in your browser, add your Cloudflare credentials, and save.
-
-**Step 4: Restart the container**
-Apply your configuration by restarting the Docker container:
-```bash
-docker-compose restart pocket-lb
-```
+Visit [http://localhost:2456/setup](http://localhost:2456/setup) in your browser, add your Cloudflare credentials, and save. Changes apply immediately — no restart needed.
 
 ## Endpoints
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/` | GET | Web dashboard (accounts, usage, quota, model mappings) |
-| `/setup` | GET/POST | Browser-based account configuration |
+| `/setup` | GET | Redirects to the dashboard Settings tab (`/?tab=settings`) |
+| `/setup` | POST | Save accounts from the dashboard form (applies immediately) |
 | `/health` | GET | Health check JSON |
-| `/usage` | GET | Token usage JSON (per-account stats) |
-| `/v1/*` | POST | OpenAI-compatible proxy (chat completions, embeddings, etc.) |
+| `/usage` | GET | Token usage JSON (per-account stats incl. `rate_limited`, plus request log) |
+| `/v1/models` | GET | OpenAI-compatible model list (aliases + live Cloudflare catalog, cached 10 min) |
+| `/v1/*` | ANY | OpenAI-compatible proxy (chat completions, embeddings, etc.) |
 
 Health check:
 
@@ -213,43 +204,55 @@ Created by the setup page. Git-ignored so secrets stay local.
     {
       "name": "account-1",
       "account_id": "your-account-id",
-      "api_token": "your-api-token"
+      "api_token": "your-api-token",
+      "token_limit": 10000000,
+      "reset_period_hours": 24
     }
   ]
 }
 ```
 
+`token_limit` / `reset_period_hours` are optional per-account quota settings (also editable in the dashboard Settings tab). Accounts over their limit are skipped until the window resets.
+
 ### Environment Variables
 
-Instead of `config.json`, you can configure accounts via environment:
+`config.json` values can be overridden (or accounts supplied entirely) via environment:
 
 ```bash
 export CLOUDFLARE_ACCOUNTS='account_id_1:token_1,account_id_2:token_2,account_id_3:token_3'
+export POCKET_LB_CONFIG=config.json   # config file path
+export POCKET_LB_HOST=127.0.0.1
 export POCKET_LB_PORT=2456
+export POCKET_LB_TIMEOUT=120          # upstream request timeout, seconds
+export POCKET_LB_MAX_ATTEMPTS=3       # accounts tried per request
 pocket-lb
 ```
 
 ## Behavior
 
-- Round-robins requests across configured accounts.
-- Retries another account on `408`, `409`, `425`, `429`, `500`, `502`, `503`, and `504`.
-- Preserves streaming responses (SSE) and extracts token usage from stream chunks.
+- Round-robins requests across configured accounts (skips rate-limited and quota-exhausted ones).
+- Tries up to `max_attempts` accounts per request, failing over on `400`, `401`, `403`, `404`, `408`, `409`, `410`, `425`, `429`, `500`, `502`, `503`, and `504`. `429` responses back off that account (honors `Retry-After`, default 60s).
+- Preserves streaming responses (SSE) and extracts token usage from stream chunks; streams without usage data are counted as unknown-token responses.
 - Adds `x-pocket-lb-account` header to responses so you can see which account handled a request.
-- Token counts are local observations from provider `usage` fields. Non-streaming responses and streaming responses with usage data are tracked; providers that omit usage are counted as unknown-token responses.
+- Failed-after-all-accounts responses include the upstream error as `upstream_detail` with `last_status`.
+- Token counts are local observations from provider `usage` fields, persisted in `state.json`; the request log persists in `request_log.json`.
 - Keeps `config.json` git-ignored so secrets are never committed.
 
 ## Dashboard
 
 The web dashboard at `http://localhost:2456/` provides:
 
-- **Quota overview** — aggregate usage across all accounts with a progress meter and donut chart.
-- **Account distribution** — per-account token usage breakdown.
-- **Per-account cards** — individual account health, usage, and quota meters.
+- **Live account status** — per-account badges derived from real recent attempts and rate-limit state (`Active` / `Rate limited` / `Error N` / `Unreachable` / `Idle`).
+- **Quota overview** — aggregate usage with a gauge (shows `No quota set` when no limits are configured).
+- **Account distribution** — per-account token usage breakdown bars.
+- **Request log** — recent proxied requests with model, mapped model, duration, handling account, and per-attempt `account:status` trail.
+- **Per-account cards** — usage, quota meters, request counts, and last-used timestamps.
 - **Model mappings** — view configured model name translations.
-- **Endpoint info** — base URL, health, and usage JSON links.
+- **Endpoint info** — base URL with copy button, host/port/retry/timeout summary, health and usage JSON links.
+- **Settings tab** — add/edit accounts (ID, token, optional quota limit + reset window) and save without restarting.
 - **Dark/light theme toggle** — dark mode uses deep near-black surfaces.
 
-The dashboard auto-refreshes usage data from the backend.
+The dashboard auto-refreshes usage data from `/usage` every 5 seconds.
 
 ## Project Structure
 
