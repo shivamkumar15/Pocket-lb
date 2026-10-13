@@ -89,17 +89,7 @@ docker-compose up -d
 **Step 3: Configure your accounts**
 Visit [http://localhost:2456/setup](http://localhost:2456/setup) in your browser, add your Cloudflare credentials, and save. Changes apply immediately — no restart needed.
 
-## Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/` | GET | Web dashboard (accounts, usage, quota, model mappings) |
-| `/setup` | GET | Redirects to the dashboard Settings tab (`/?tab=settings`) |
-| `/setup` | POST | Save accounts from the dashboard form (applies immediately) |
-| `/health` | GET | Health check JSON |
-| `/usage` | GET | Token usage JSON (per-account stats incl. `rate_limited`, plus request log) |
-| `/v1/models` | GET | OpenAI-compatible model list (aliases + live Cloudflare catalog, cached 10 min) |
-| `/v1/*` | ANY | OpenAI-compatible proxy (chat completions, embeddings, etc.) |
 
 Health check:
 
