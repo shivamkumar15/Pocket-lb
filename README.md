@@ -260,4 +260,5 @@ Pocket-lb/
 ├── pyproject.toml
 └── README.md
 ```
+## NOTE: This dosent work anymore because cloudflare dosent provide any new model for free.
 
